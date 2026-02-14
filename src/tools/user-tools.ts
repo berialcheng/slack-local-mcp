@@ -1,0 +1,213 @@
+/**
+ * User tools for searching and managing Slack users
+ */
+
+import { z } from 'zod';
+import { SlackClient } from '../slack-client.js';
+import { logger } from '../utils/logger.js';
+import { handleSlackError, formatErrorForMCP } from '../utils/errors.js';
+
+/**
+ * Tool: search_users
+ * Search for users by name and return multiple matches
+ */
+export const searchUsersTool = {
+  name: 'search_users',
+  description: 'Search for Slack users by name (display name, real name, or username). Returns multiple matches if found, helping you identify the correct user when names are ambiguous. Use this before sending direct messages to ensure you have the right person.',
+  inputSchema: z.object({
+    query: z.string().min(1).describe('Search query (name, display name, or username to search for)'),
+    limit: z.number().optional().default(10).describe('Maximum number of results to return (default: 10)'),
+  }),
+};
+
+export interface SearchUsersInput {
+  query: string;
+  limit?: number;
+}
+
+export interface UserSearchResult {
+  id: string;
+  name: string;
+  display_name: string;
+  real_name: string;
+  email?: string;
+}
+
+export interface SearchUsersOutput {
+  query: string;
+  results: UserSearchResult[];
+  match_count: number;
+}
+
+/**
+ * Calculate Levenshtein distance between two strings
+ * Used for fuzzy matching to handle typos
+ */
+function levenshteinDistance(str1: string, str2: string): number {
+  const len1 = str1.length;
+  const len2 = str2.length;
+  const matrix: number[][] = [];
+
+  // Initialize matrix
+  for (let i = 0; i <= len1; i++) {
+    matrix[i] = [i];
+  }
+  for (let j = 0; j <= len2; j++) {
+    matrix[0][j] = j;
+  }
+
+  // Fill matrix
+  for (let i = 1; i <= len1; i++) {
+    for (let j = 1; j <= len2; j++) {
+      const cost = str1[i - 1] === str2[j - 1] ? 0 : 1;
+      matrix[i][j] = Math.min(
+        matrix[i - 1][j] + 1,      // deletion
+        matrix[i][j - 1] + 1,      // insertion
+        matrix[i - 1][j - 1] + cost // substitution
+      );
+    }
+  }
+
+  return matrix[len1][len2];
+}
+
+/**
+ * Check if two strings are similar enough (handles typos)
+ * Returns a similarity score (0-100, higher is better)
+ */
+function similarityScore(query: string, target: string): number {
+  if (query === target) return 100;
+  if (target.includes(query)) return 60;
+  
+  const distance = levenshteinDistance(query, target);
+  
+  // Allow up to 2 character differences for strings > 4 chars
+  // or 1 difference for shorter strings
+  const threshold = query.length > 4 ? 2 : 1;
+  
+  if (distance <= threshold) {
+    // Return score based on how close the match is
+    return 50 - (distance * 10); // 50 for 1 char diff, 40 for 2 char diff
+  }
+  
+  return 0;
+}
+
+export async function handleSearchUsers(
+  input: SearchUsersInput,
+  client: SlackClient
+): Promise<SearchUsersOutput | string | ReturnType<typeof formatErrorForMCP>> {
+  try {
+    // Clean and normalize query
+    // Remove @ prefix, strip email domain suffixes, normalize separators
+    let cleanQuery = input.query.trim().replace(/^@/, '').toLowerCase();
+
+    // Validate query after cleaning
+    if (!cleanQuery) {
+      return 'Search query cannot be empty.';
+    }
+
+    // Strip common email/domain suffixes (e.g., "-company.com", "@company.com")
+    // This makes the search more flexible for corporate email formats
+    cleanQuery = cleanQuery.replace(/[-@][a-z0-9-]+\.(com|net|org|io|dev)$/i, '');
+
+    const limit = input.limit || 10;
+    
+    logger.info('Searching for users', { query: cleanQuery, originalQuery: input.query, limit });
+
+    // Get user list from cache
+    const cache = await client.getUserList();
+
+    // Search for users by name, display_name, or real_name
+    // Use fuzzy matching for better results
+    const matches = cache.users
+      .map((user) => {
+        const name = user.name.toLowerCase();
+        const displayName = user.display_name.toLowerCase();
+        const realName = user.real_name.toLowerCase();
+        
+        // Normalize fields for comparison (replace dots/hyphens with nothing for fuzzy matching)
+        const normalizedName = name.replace(/[.\-_]/g, '');
+        const normalizedQuery = cleanQuery.replace(/[.\-_]/g, '');
+        
+        // Calculate match score
+        let score = 0;
+        
+        // Exact matches get highest score
+        if (name === cleanQuery || displayName === cleanQuery || realName === cleanQuery) {
+          score = 100;
+        }
+        // Normalized exact match (ignoring dots, hyphens, underscores)
+        else if (normalizedName === normalizedQuery) {
+          score = 95;
+        }
+        // Starts with query (exact or normalized)
+        else if (name.startsWith(cleanQuery) || displayName.startsWith(cleanQuery) || realName.startsWith(cleanQuery)) {
+          score = 80;
+        }
+        else if (normalizedName.startsWith(normalizedQuery)) {
+          score = 75;
+        }
+        // Word boundary match in real name (e.g., "Khanh" matches "Khanh Nguyen")
+        else if (realName.split(' ').some(word => word.startsWith(cleanQuery))) {
+          score = 70;
+        }
+        // Contains query (exact or normalized)
+        else if (name.includes(cleanQuery) || displayName.includes(cleanQuery) || realName.includes(cleanQuery)) {
+          score = 60;
+        }
+        else if (normalizedName.includes(normalizedQuery)) {
+          score = 55;
+        }
+        // Fuzzy matching for typos - check each word in real name and display name
+        else {
+          const realNameWords = realName.split(' ');
+          const displayNameParts = displayName.split(/[.\-@]/);
+          
+          // Check similarity with each word/part
+          const allParts = [...realNameWords, ...displayNameParts];
+          let maxSimilarity = 0;
+          
+          for (const part of allParts) {
+            const similarity = similarityScore(cleanQuery, part);
+            if (similarity > maxSimilarity) {
+              maxSimilarity = similarity;
+            }
+          }
+          
+          if (maxSimilarity > 0) {
+            score = maxSimilarity;
+          }
+        }
+        
+        return { user, score };
+      })
+      .filter(({ score }) => score > 0)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, limit)
+      .map(({ user }) => user);
+
+    const results: UserSearchResult[] = matches.map((user) => ({
+      id: user.id,
+      name: user.name,
+      display_name: user.display_name || user.name,
+      real_name: user.real_name || user.name,
+    }));
+
+    // Return simple string for no results
+    if (results.length === 0) {
+      return `No users found matching "${input.query}".`;
+    }
+
+    // Return just the data - no verbose message (data is self-explanatory)
+    return {
+      query: input.query,
+      results,
+      match_count: results.length,
+    };
+  } catch (error) {
+    logger.error('Failed to search users', error);
+    const slackError = handleSlackError(error, 'search_users');
+    return formatErrorForMCP(slackError);
+  }
+}
