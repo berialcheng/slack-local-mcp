@@ -242,7 +242,6 @@ Sort: timestamp (desc)
 - `SLACK_USER_AGENT`: Custom User-Agent (default: `Slack-MCP-Client/1.0`)
 - `LOG_LEVEL`: `debug`, `info`, `warn`, or `error` (default: `info`)
 - `SLACK_USER_CACHE_FILE`: User list cache path (default: `/tmp/slack-mcp-users-cache.json`)
-- `SLACK_USER_CACHE_TTL`: Cache duration in seconds (default: `86400` = 24 hours)
 
 ## Performance: TOON Format
 

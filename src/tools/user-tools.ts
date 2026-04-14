@@ -3,7 +3,7 @@
  */
 
 import { z } from 'zod';
-import { SlackClient } from '../slack-client.js';
+import { SlackClient, UserRecord } from '../slack-client.js';
 import { logger } from '../utils/logger.js';
 import { handleSlackError, formatErrorForMCP } from '../utils/errors.js';
 
@@ -37,6 +37,8 @@ export interface SearchUsersOutput {
   query: string;
   results: UserSearchResult[];
   match_count: number;
+  source: 'cache' | 'api';
+  exhaustive: boolean;
 }
 
 /**
@@ -78,19 +80,73 @@ function levenshteinDistance(str1: string, str2: string): number {
 function similarityScore(query: string, target: string): number {
   if (query === target) return 100;
   if (target.includes(query)) return 60;
-  
+
   const distance = levenshteinDistance(query, target);
-  
+
   // Allow up to 2 character differences for strings > 4 chars
   // or 1 difference for shorter strings
   const threshold = query.length > 4 ? 2 : 1;
-  
+
   if (distance <= threshold) {
     // Return score based on how close the match is
     return 50 - (distance * 10); // 50 for 1 char diff, 40 for 2 char diff
   }
-  
+
   return 0;
+}
+
+/**
+ * Create a scoring function for user search.
+ * Scores users based on how well they match the query.
+ */
+export function createUserScoreFn(cleanQuery: string): (user: UserRecord) => number {
+  const normalizedQuery = cleanQuery.replace(/[.\-_]/g, '');
+
+  return (user: UserRecord): number => {
+    const name = user.name.toLowerCase();
+    const displayName = user.display_name.toLowerCase();
+    const realName = user.real_name.toLowerCase();
+    const normalizedName = name.replace(/[.\-_]/g, '');
+
+    // Exact matches get highest score
+    if (name === cleanQuery || displayName === cleanQuery || realName === cleanQuery) {
+      return 100;
+    }
+    // Normalized exact match (ignoring dots, hyphens, underscores)
+    if (normalizedName === normalizedQuery) {
+      return 95;
+    }
+    // Starts with query (exact or normalized)
+    if (name.startsWith(cleanQuery) || displayName.startsWith(cleanQuery) || realName.startsWith(cleanQuery)) {
+      return 80;
+    }
+    if (normalizedName.startsWith(normalizedQuery)) {
+      return 75;
+    }
+    // Word boundary match in real name
+    if (realName.split(' ').some(word => word.startsWith(cleanQuery))) {
+      return 70;
+    }
+    // Contains query (exact or normalized)
+    if (name.includes(cleanQuery) || displayName.includes(cleanQuery) || realName.includes(cleanQuery)) {
+      return 60;
+    }
+    if (normalizedName.includes(normalizedQuery)) {
+      return 55;
+    }
+    // Fuzzy matching for typos
+    const realNameWords = realName.split(' ');
+    const displayNameParts = displayName.split(/[.\-@]/);
+    const allParts = [...realNameWords, ...displayNameParts];
+    let maxSimilarity = 0;
+    for (const part of allParts) {
+      const similarity = similarityScore(cleanQuery, part);
+      if (similarity > maxSimilarity) {
+        maxSimilarity = similarity;
+      }
+    }
+    return maxSimilarity;
+  };
 }
 
 export async function handleSearchUsers(
@@ -99,111 +155,39 @@ export async function handleSearchUsers(
 ): Promise<SearchUsersOutput | string | ReturnType<typeof formatErrorForMCP>> {
   try {
     // Clean and normalize query
-    // Remove @ prefix, strip email domain suffixes, normalize separators
     let cleanQuery = input.query.trim().replace(/^@/, '').toLowerCase();
 
-    // Validate query after cleaning
     if (!cleanQuery) {
       return 'Search query cannot be empty.';
     }
 
-    // Strip common email/domain suffixes (e.g., "-company.com", "@company.com")
-    // This makes the search more flexible for corporate email formats
+    // Strip common email/domain suffixes
     cleanQuery = cleanQuery.replace(/[-@][a-z0-9-]+\.(com|net|org|io|dev)$/i, '');
 
     const limit = input.limit || 10;
-    
+
     logger.info('Searching for users', { query: cleanQuery, originalQuery: input.query, limit });
 
-    // Get user list from cache
-    const cache = await client.getUserList();
+    const scoreFn = createUserScoreFn(cleanQuery);
+    const searchResult = await client.searchUsersIncremental(scoreFn, limit);
 
-    // Search for users by name, display_name, or real_name
-    // Use fuzzy matching for better results
-    const matches = cache.users
-      .map((user) => {
-        const name = user.name.toLowerCase();
-        const displayName = user.display_name.toLowerCase();
-        const realName = user.real_name.toLowerCase();
-        
-        // Normalize fields for comparison (replace dots/hyphens with nothing for fuzzy matching)
-        const normalizedName = name.replace(/[.\-_]/g, '');
-        const normalizedQuery = cleanQuery.replace(/[.\-_]/g, '');
-        
-        // Calculate match score
-        let score = 0;
-        
-        // Exact matches get highest score
-        if (name === cleanQuery || displayName === cleanQuery || realName === cleanQuery) {
-          score = 100;
-        }
-        // Normalized exact match (ignoring dots, hyphens, underscores)
-        else if (normalizedName === normalizedQuery) {
-          score = 95;
-        }
-        // Starts with query (exact or normalized)
-        else if (name.startsWith(cleanQuery) || displayName.startsWith(cleanQuery) || realName.startsWith(cleanQuery)) {
-          score = 80;
-        }
-        else if (normalizedName.startsWith(normalizedQuery)) {
-          score = 75;
-        }
-        // Word boundary match in real name (e.g., "Khanh" matches "Khanh Nguyen")
-        else if (realName.split(' ').some(word => word.startsWith(cleanQuery))) {
-          score = 70;
-        }
-        // Contains query (exact or normalized)
-        else if (name.includes(cleanQuery) || displayName.includes(cleanQuery) || realName.includes(cleanQuery)) {
-          score = 60;
-        }
-        else if (normalizedName.includes(normalizedQuery)) {
-          score = 55;
-        }
-        // Fuzzy matching for typos - check each word in real name and display name
-        else {
-          const realNameWords = realName.split(' ');
-          const displayNameParts = displayName.split(/[.\-@]/);
-          
-          // Check similarity with each word/part
-          const allParts = [...realNameWords, ...displayNameParts];
-          let maxSimilarity = 0;
-          
-          for (const part of allParts) {
-            const similarity = similarityScore(cleanQuery, part);
-            if (similarity > maxSimilarity) {
-              maxSimilarity = similarity;
-            }
-          }
-          
-          if (maxSimilarity > 0) {
-            score = maxSimilarity;
-          }
-        }
-        
-        return { user, score };
-      })
-      .filter(({ score }) => score > 0)
-      .sort((a, b) => b.score - a.score)
-      .slice(0, limit)
-      .map(({ user }) => user);
-
-    const results: UserSearchResult[] = matches.map((user) => ({
+    const results: UserSearchResult[] = searchResult.results.map((user) => ({
       id: user.id,
       name: user.name,
       display_name: user.display_name || user.name,
       real_name: user.real_name || user.name,
     }));
 
-    // Return simple string for no results
     if (results.length === 0) {
       return `No users found matching "${input.query}".`;
     }
 
-    // Return just the data - no verbose message (data is self-explanatory)
     return {
       query: input.query,
       results,
       match_count: results.length,
+      source: searchResult.source,
+      exhaustive: searchResult.exhaustive,
     };
   } catch (error) {
     logger.error('Failed to search users', error);

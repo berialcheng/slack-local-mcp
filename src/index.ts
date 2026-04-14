@@ -96,18 +96,11 @@ async function initializeClient(): Promise<void> {
       userAgent: process.env.SLACK_USER_AGENT,
       logLevel: (process.env.LOG_LEVEL as 'debug' | 'info' | 'warn' | 'error') || 'info',
       userCacheFile: process.env.SLACK_USER_CACHE_FILE,
-      userCacheTTL: process.env.SLACK_USER_CACHE_TTL ? parseInt(process.env.SLACK_USER_CACHE_TTL, 10) : undefined,
     });
 
     // Authenticate
     await slackClient.authenticate();
-    
-    // Prefetch user list in background (non-blocking)
-    // This will use cached data if available, or fetch in background
-    slackClient.getUserList()
-      .then(() => logger.info('User list cache ready'))
-      .catch((error) => logger.warn('No user list cache available, populating in background', error));
-    
+
     logger.info('Slack MCP Server initialized successfully');
   } catch (error) {
     logger.error('Failed to initialize Slack client', error);

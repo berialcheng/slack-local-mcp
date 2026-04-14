@@ -394,7 +394,6 @@ export interface SlackClientConfig {
   userAgent?: string;
   logLevel?: LogLevel;
   userCacheFile?: string;
-  userCacheTTL?: number; // in seconds
 }
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';

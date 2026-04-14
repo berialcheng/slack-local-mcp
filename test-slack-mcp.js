@@ -350,10 +350,10 @@ async function runTests() {
     // Test 15: Search Users
     logSection('Test 15: Search Users');
     try {
-      const userList = await client.getUserList();
-      
+      const userList = client.getOrLoadUserListCache();
+
       // Test exact match
-      if (userList.users.length > 0) {
+      if (userList && userList.users.length > 0) {
         const testUser = userList.users[0];
         const searchQuery = testUser.name;
         
@@ -379,7 +379,7 @@ async function runTests() {
       }
       
       // Test partial match
-      if (userList.users.length > 0) {
+      if (userList && userList.users.length > 0) {
         const testUser = userList.users[0];
         const partialQuery = testUser.name.substring(0, 3);
         
@@ -402,30 +402,34 @@ async function runTests() {
       }
       
       // Test no match
-      const noMatchQuery = 'xyzabc123nonexistent';
-      const noMatches = userList.users.filter(u => {
-        const name = u.name.toLowerCase();
-        const displayName = u.display_name.toLowerCase();
-        const realName = u.real_name.toLowerCase();
-        const query = noMatchQuery.toLowerCase();
-        
-        return name.includes(query) ||
-               displayName.includes(query) ||
-               realName.includes(query);
-      });
-      
-      logTest(
-        'Search users - no match',
-        noMatches.length === 0,
-        `Correctly returned 0 matches for "${noMatchQuery}"`
-      );
-      
-      // Test user cache exists
-      logTest(
-        'User list cache',
-        userList.users.length > 0,
-        `User cache contains ${userList.users.length} user(s)`
-      );
+      if (userList) {
+        const noMatchQuery = 'xyzabc123nonexistent';
+        const noMatches = userList.users.filter(u => {
+          const name = u.name.toLowerCase();
+          const displayName = u.display_name.toLowerCase();
+          const realName = u.real_name.toLowerCase();
+          const query = noMatchQuery.toLowerCase();
+
+          return name.includes(query) ||
+                 displayName.includes(query) ||
+                 realName.includes(query);
+        });
+
+        logTest(
+          'Search users - no match',
+          noMatches.length === 0,
+          `Correctly returned 0 matches for "${noMatchQuery}"`
+        );
+
+        // Test user cache exists
+        logTest(
+          'User list cache',
+          userList.users.length > 0,
+          `User cache contains ${userList.users.length} user(s)`
+        );
+      } else {
+        logTest('Search users', false, 'No user cache available');
+      }
       
     } catch (error) {
       logTest('Search users', false, error.message);
@@ -451,8 +455,8 @@ async function runTests() {
     // Test 17: Lookup User by Name
     logSection('Test 17: Lookup User by Name');
     try {
-      const userList = await client.getUserList();
-      if (userList.users.length > 0) {
+      const userList = client.getOrLoadUserListCache();
+      if (userList && userList.users.length > 0) {
         const testUser = userList.users[0];
         const foundUserId = await client.lookupUserByName(testUser.name);
         

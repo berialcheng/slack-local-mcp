@@ -28,20 +28,23 @@ import { logger } from './utils/logger.js';
 import { handleSlackError } from './utils/errors.js';
 import { validateSlackCookie } from './utils/validation.js';
 
+export type UserRecord = {
+  id: string;
+  name: string;
+  display_name: string;
+  real_name: string;
+};
+
 interface UserCacheData {
-  users: Array<{
-    id: string;
-    name: string;
-    display_name: string;
-    real_name: string;
-  }>;
+  users: UserRecord[];
   timestamp: number;
   workspace_id: string;
 }
 
-interface BackgroundRefreshState {
-  isRefreshing: boolean;
-  lastRefreshAttempt: number;
+export interface SearchUsersIncrementalResult {
+  results: Array<UserRecord & { score: number }>;
+  source: 'cache' | 'api';
+  exhaustive: boolean;
 }
 
 export class SlackClient {
@@ -56,12 +59,7 @@ export class SlackClient {
   private userCache: Map<string, string> = new Map();
   private userListCache: UserCacheData | null = null;
   private userCacheFile: string;
-  private userCacheTTL: number;
   private retryDelay = 1000; // milliseconds
-  private backgroundRefreshState: BackgroundRefreshState = {
-    isRefreshing: false,
-    lastRefreshAttempt: 0,
-  };
 
   constructor(config: SlackClientConfig) {
     // Validate cookie
@@ -71,9 +69,8 @@ export class SlackClient {
     this.workspaceUrl = config.workspaceUrl;
     this.userAgent = config.userAgent || 'Slack-MCP-Client/1.0';
     
-    // Configure user list cache (from config or defaults)
+    // Configure user list cache file path
     this.userCacheFile = config.userCacheFile || '/tmp/slack-mcp-users-cache.json';
-    this.userCacheTTL = (config.userCacheTTL || 86400) * 1000; // Default 24 hours, convert to ms
     
     // Create workspace client for initial token fetch
     this.workspaceClient = axios.create({
@@ -798,8 +795,11 @@ export class SlackClient {
         return null;
       }
 
-      // Don't check expiry here - we'll handle stale cache in getUserList
-      // Just validate the cache structure
+      // Validate cache structure
+      if (!Array.isArray(cache.users)) {
+        logger.debug('Invalid cache structure, ignoring');
+        return null;
+      }
       const now = Date.now();
       
       logger.debug('Loaded user list cache from file', {
@@ -836,212 +836,187 @@ export class SlackClient {
   }
 
   /**
-   * Fetch and cache the full user list with pagination support
+   * Paginate through users.list incrementally, applying scoreFn per page.
+   * Stops early when enough high-confidence matches are found.
+   * Saves full cache to disk only when all pages have been fetched.
    */
-  private async fetchAndCacheUserList(): Promise<UserCacheData> {
+  async searchUsersIncremental(
+    scoreFn: (user: UserRecord) => number,
+    limit: number,
+    earlyStopThreshold: number = 80,
+    skipCache: boolean = false,
+  ): Promise<SearchUsersIncrementalResult> {
+    // Phase 1: Try cache first (zero API calls)
+    if (!skipCache) {
+      const cached = this.getOrLoadUserListCache();
+      if (cached) {
+        const scored = cached.users
+          .map((u) => ({ ...u, score: scoreFn(u) }))
+          .filter((s) => s.score > 0)
+          .sort((a, b) => b.score - a.score)
+          .slice(0, limit);
+        return { results: scored, source: 'cache', exhaustive: true };
+      }
+    }
+
+    // Phase 2: Incremental API pagination
     try {
-      logger.info('Fetching user list from Slack API');
-
-      const allUsers: SlackUser[] = [];
+      logger.info('Searching users via incremental API pagination');
+      const allFetchedUsers: UserRecord[] = [];
+      const scoredResults: Array<UserRecord & { score: number }> = [];
       let cursor: string | undefined = undefined;
-      const limit = 1000; // Maximum allowed by Slack API
+      const pageSize = 200;
 
-      // Fetch all pages
       do {
         const params: Record<string, string> = {
           token: this.apiToken!,
-          limit: String(limit),
+          limit: String(pageSize),
         };
-
         if (cursor) {
           params.cursor = cursor;
         }
 
         const response = await this.client.get('/users.list', {
           params,
-          headers: {
-            Cookie: `d=${this.cookieD}`,
-          },
+          headers: { Cookie: `d=${this.cookieD}` },
         });
 
         if (!response.data.ok) {
           throw new Error(response.data.error || 'Failed to list users');
         }
 
-        // Add users from this page
-        if (response.data.members && Array.isArray(response.data.members)) {
-          allUsers.push(...response.data.members);
-          logger.debug(`Fetched ${response.data.members.length} users (total: ${allUsers.length})`);
+        const pageUsers: UserRecord[] = (response.data.members || [])
+          .filter((u: SlackUser) => !u.deleted && !u.is_bot)
+          .map((u: SlackUser) => ({
+            id: u.id,
+            name: u.name,
+            display_name: u.profile.display_name || '',
+            real_name: u.real_name || '',
+          }));
+
+        allFetchedUsers.push(...pageUsers);
+
+        // Side effect: populate in-memory userCache for resolveUsername
+        for (const u of pageUsers) {
+          this.userCache.set(u.id, u.display_name || u.real_name || u.name);
         }
 
-        // Get cursor for next page
-        cursor = response.data.response_metadata?.next_cursor;
-        
-        // If there's a next page, add a small delay to avoid rate limits
+        // Score this page
+        for (const u of pageUsers) {
+          const score = scoreFn(u);
+          if (score > 0) {
+            scoredResults.push({ ...u, score });
+          }
+        }
+        // Keep sorted
+        scoredResults.sort((a, b) => b.score - a.score);
+
+        logger.debug(`Paginated ${allFetchedUsers.length} users so far, ${scoredResults.length} matches`);
+
+        cursor = response.data.response_metadata?.next_cursor || undefined;
+
+        // Early termination: enough high-confidence matches AND more pages remain
+        if (cursor && scoredResults.length >= limit) {
+          const topN = scoredResults.slice(0, limit);
+          if (topN.every((r) => r.score >= earlyStopThreshold)) {
+            logger.info(`Early stop: found ${limit} matches scoring >= ${earlyStopThreshold}`);
+            return { results: topN, source: 'api', exhaustive: false };
+          }
+        }
+
         if (cursor) {
-          await this.sleep(3000);
+          await this.sleep(1000);
         }
       } while (cursor);
 
-      // Extract relevant user data and filter out deleted users and bots
-      const users = allUsers
-        .filter((u: SlackUser) => {
-          // Exclude deleted users
-          if (u.deleted) return false;
-          // Exclude bots
-          if (u.is_bot) return false;
-          return true;
-        })
-        .map((u: SlackUser) => ({
-          id: u.id,
-          name: u.name,
-          display_name: u.profile.display_name || '',
-          real_name: u.real_name || '',
-        }));
-
+      // Exhausted all pages — save full list to file cache
       const cache: UserCacheData = {
-        users,
+        users: allFetchedUsers,
         timestamp: Date.now(),
         workspace_id: this.workspaceId!,
       };
-
-      // Save to memory and file
       this.userListCache = cache;
       this.saveUserListCache(cache);
+      logger.info(`Full pagination complete: ${allFetchedUsers.length} users cached`);
 
-      logger.info(`Cached ${users.length} users from ${allUsers.length} total members`);
-
-      return cache;
+      return {
+        results: scoredResults.slice(0, limit),
+        source: 'api',
+        exhaustive: true,
+      };
     } catch (error) {
-      logger.error('Failed to fetch user list', error);
-      throw handleSlackError(error, 'fetch_user_list');
+      logger.error('Failed to search users incrementally', error);
+      throw handleSlackError(error, 'search_users_incremental');
     }
   }
 
   /**
-   * Get user list from cache or fetch if needed
-   * Uses stale-while-revalidate pattern to avoid blocking on cache refresh
+   * Get user list from cache only (memory or file). Never triggers API calls.
+   * Returns null if no cache is available.
    */
-  async getUserList(): Promise<UserCacheData> {
-    const now = Date.now();
-
-    // Check memory cache first
+  getOrLoadUserListCache(): UserCacheData | null {
     if (this.userListCache) {
-      const cacheAge = now - this.userListCache.timestamp;
-      
-      if (cacheAge <= this.userCacheTTL) {
-        // Cache is fresh, use it
-        logger.debug('Using fresh in-memory user list cache');
-        return this.userListCache;
-      } else {
-        // Cache is stale but exists - use it and trigger background refresh
-        logger.debug('Cache is stale, using stale cache and triggering background refresh');
-        this.triggerBackgroundRefresh();
-        return this.userListCache;
-      }
+      return this.userListCache;
     }
-
-    // Try to load from file cache
     const fileCache = this.loadUserListCache();
     if (fileCache) {
       this.userListCache = fileCache;
-      const cacheAge = now - fileCache.timestamp;
-      
-      if (cacheAge <= this.userCacheTTL) {
-        // File cache is fresh
-        logger.debug('Using fresh file cache');
-        return fileCache;
-      } else {
-        // File cache is stale - use it and trigger background refresh
-        logger.debug('File cache is stale, using stale cache and triggering background refresh');
-        this.triggerBackgroundRefresh();
-        return fileCache;
-      }
     }
-
-    // No cache available - check if already populating
-    if (this.backgroundRefreshState.isRefreshing) {
-      // Cache is being populated, inform caller to retry
-      const elapsed = Math.floor((now - this.backgroundRefreshState.lastRefreshAttempt) / 1000);
-      throw new Error(
-        `User cache is being populated. Started ${elapsed}s ago. Please try again in a few moments.`
-      );
-    }
-
-    // Start background population if not already in progress
-    logger.info('No cache available, starting background population');
-    this.triggerBackgroundRefresh();
-    
-    // Throw error to inform caller to retry
-    throw new Error(
-      'User cache is being populated. Please try again in a few moments.'
-    );
+    return this.userListCache;
   }
 
   /**
-   * Trigger background refresh of user list cache
-   * Uses stale-while-revalidate pattern to avoid blocking operations
-   */
-  private triggerBackgroundRefresh(): void {
-    const now = Date.now();
-    const minRefreshInterval = 60000; // Don't refresh more than once per minute
-
-    // Check if already refreshing or recently attempted
-    if (this.backgroundRefreshState.isRefreshing) {
-      logger.debug('Background refresh already in progress, skipping');
-      return;
-    }
-
-    if (now - this.backgroundRefreshState.lastRefreshAttempt < minRefreshInterval) {
-      logger.debug('Background refresh attempted recently, skipping');
-      return;
-    }
-
-    // Mark as refreshing and update last attempt time
-    this.backgroundRefreshState.isRefreshing = true;
-    this.backgroundRefreshState.lastRefreshAttempt = now;
-
-    // Fetch in background without awaiting
-    this.fetchAndCacheUserList()
-      .then(() => {
-        logger.info('Background user cache refresh completed successfully');
-      })
-      .catch((error) => {
-        logger.warn('Background user cache refresh failed', error);
-      })
-      .finally(() => {
-        this.backgroundRefreshState.isRefreshing = false;
-      });
-  }
-
-  /**
-   * Look up user ID by username or display name
+   * Look up user ID by username or display name.
+   * Checks in-memory cache, then file cache, then does incremental API search.
    */
   async lookupUserByName(username: string): Promise<string | null> {
     try {
-      // Remove @ prefix if present
       const cleanUsername = username.replace(/^@/, '');
-      
+      const searchTerm = cleanUsername.toLowerCase();
+
       logger.info('Looking up user by name', { username: cleanUsername });
 
-      // Get user list from cache
-      const cache = await this.getUserList();
+      // 1. Check in-memory userCache (ID→display_name map)
+      for (const [id, displayName] of this.userCache.entries()) {
+        if (displayName.toLowerCase() === searchTerm) {
+          logger.info('Found user in memory cache', { userId: id });
+          return id;
+        }
+      }
 
-      // Search for user by name, display_name, or real_name
-      const user = cache.users.find((u) => {
-        const name = u.name.toLowerCase();
-        const displayName = u.display_name.toLowerCase();
-        const realName = u.real_name.toLowerCase();
-        const searchTerm = cleanUsername.toLowerCase();
-        
-        return name === searchTerm ||
-               displayName === searchTerm ||
-               realName === searchTerm;
-      });
+      // 2. Check file cache
+      const cached = this.getOrLoadUserListCache();
+      if (cached) {
+        const user = cached.users.find((u) => {
+          return u.name.toLowerCase() === searchTerm ||
+                 u.display_name.toLowerCase() === searchTerm ||
+                 u.real_name.toLowerCase() === searchTerm;
+        });
+        if (user) {
+          logger.info('Found user in file cache', { userId: user.id, name: user.name });
+          return user.id;
+        }
+        // Cache exists but user not found — trust the cache and return null.
+        // If the user was recently added to the workspace, call search_users first
+        // to refresh the cache, then retry.
+        logger.warn('User not found in cache', { username: cleanUsername });
+        return null;
+      }
 
-      if (user) {
-        logger.info('Found user', { userId: user.id, name: user.name });
-        return user.id;
+      // 3. Incremental API search with exact-match scoring (skip cache since we already checked)
+      const exactMatchScoreFn = (u: UserRecord): number => {
+        if (u.name.toLowerCase() === searchTerm ||
+            u.display_name.toLowerCase() === searchTerm ||
+            u.real_name.toLowerCase() === searchTerm) {
+          return 100;
+        }
+        return 0;
+      };
+
+      const result = await this.searchUsersIncremental(exactMatchScoreFn, 1, 100, true);
+      if (result.results.length > 0) {
+        logger.info('Found user via API search', { userId: result.results[0].id });
+        return result.results[0].id;
       }
 
       logger.warn('User not found', { username: cleanUsername });
