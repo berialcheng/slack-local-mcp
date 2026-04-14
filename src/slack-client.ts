@@ -865,7 +865,7 @@ export class SlackClient {
       const allFetchedUsers: UserRecord[] = [];
       const scoredResults: Array<UserRecord & { score: number }> = [];
       let cursor: string | undefined = undefined;
-      const pageSize = 200;
+      const pageSize = 100;
 
       do {
         const params: Record<string, string> = {
