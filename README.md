@@ -60,6 +60,51 @@ Add to your MCP client configuration (e.g., Claude Code `~/.claude/settings.json
 }
 ```
 
+### Windows: Codex and OpenCode
+
+On Windows, an MCP client that was already running may not inherit newly added
+user environment variables. This can make the server exit before the MCP
+`initialize` response. The optional Windows launcher keeps existing process
+environment values and falls back to `HKCU\Environment` only when a value is
+missing.
+
+First, set `SLACK_COOKIE_D` and `SLACK_WORKSPACE_URL` as Windows **user**
+environment variables, then build the project:
+
+```powershell
+npm install
+npm run build
+```
+
+Configure Codex with the tracked launcher:
+
+```powershell
+codex mcp add slack-local -- node C:\absolute\path\to\slack-local-mcp\scripts\start-windows.mjs
+```
+
+For OpenCode, add a local MCP entry to `~/.config/opencode/opencode.json`:
+
+```json
+{
+  "mcp": {
+    "slack-local": {
+      "type": "local",
+      "command": [
+        "node",
+        "C:\\absolute\\path\\to\\slack-local-mcp\\scripts\\start-windows.mjs"
+      ],
+      "enabled": true,
+      "timeout": 15000
+    }
+  }
+}
+```
+
+You can also start the same launcher manually with `npm run start:windows`.
+Windows user environment variables are stored in the current user's registry;
+they are not an encrypted secrets vault. Keep the Slack cookie private and
+rotate it if it is exposed.
+
 ### 4. Start Using
 
 Your AI assistant can now control Slack with natural language:

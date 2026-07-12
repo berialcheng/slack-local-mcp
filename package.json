@@ -9,9 +9,11 @@
   },
   "scripts": {
     "build": "tsc",
+    "start:windows": "node scripts/start-windows.mjs",
     "watch": "tsc --watch",
     "prepare": "npm run build",
-    "test": "node test-slack-mcp.js"
+    "test": "node test-slack-mcp.js",
+    "test:windows": "node --test test/windows-launcher.test.mjs"
   },
   "keywords": [
     "mcp",
