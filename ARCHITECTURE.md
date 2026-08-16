@@ -1,17 +1,24 @@
 # Slack MCP Server - Architecture & Design Document
 
 ## Overview
-A Model Context Protocol (MCP) server that provides tools for interacting with Slack using cookie-based authentication from web sessions. This server enables sending/editing/deleting messages, scheduling messages, managing reminders, fetching conversations for summarization, and reacting to messages.
+
+A Model Context Protocol (MCP) server that provides tools for interacting with Slack using cookie-based authentication from web sessions. This server enables sending/editing/deleting messages, attempting native scheduling where the token permits it, fetching conversations for summarization, reacting to messages, and downloading policy-approved Slack files to temporary local storage.
 
 ## Authentication Strategy
 
 ### Phase 1: Cookie-Based Authentication (Current Scope)
+
 - Uses the `d` cookie from Slack web session
+- Defers Windows user-environment lookup, Slack client loading, token retrieval, and `auth.test` until the first valid tool call
+- Coalesces concurrent first calls into one authentication attempt and reuses the authenticated client per MCP process
+- Bounds initialization to 45 seconds, propagates MCP cancellation into Slack requests, and retries once with a new client after an authenticated client reports token expiry
+- Validates the initial workspace URL and every token-page redirect as HTTPS on a Slack-owned host before attaching the cookie
 - Reference: https://papermtn.co.uk/retrieving-and-using-slack-cookies-for-authentication/
 - Requires users to extract cookie from their browser's developer tools
 - Single workspace focus
 
 ### Phase 2: OAuth/Bot Token Support (Future)
+
 - Support for official Slack OAuth tokens
 - Support for Bot tokens
 - Multi-workspace capability
@@ -24,47 +31,48 @@ graph TB
     B -->|Cookie Auth| C[Slack Web API]
     B -->|Tool Calls| D[Tool Handlers]
     D -->|API Requests| C
-    
+
     D --> E[Message Tools]
-    D --> F[Scheduling Tools]
+    D -. opt-in .-> F[Scheduling Tools]
     D --> G[Fetch Tools]
     D --> H[Reaction Tools]
-    D --> I[Reminder Tools]
     D --> J[Search Tools]
-    
+    D --> K[File Tools]
+
     E --> E1[Send to Channel]
     E --> E2[Send DM]
     E --> E3[Reply to Thread]
     E --> E4[Edit Message]
     E --> E5[Delete Message]
-    
+
     F --> F1[Schedule Message]
-    
+
     G --> G1[Fetch Channel Messages]
     G --> G2[Fetch Thread Messages]
-    
+
     H --> H1[Add Reaction]
-    
-    I --> I1[List Reminders]
-    I --> I2[Create Reminder]
-    I --> I3[Complete Reminder]
-    I --> I4[Delete Reminder]
-    
+
     J --> J1[Search Messages]
+
+    K --> K1[Get File Info]
+    K --> K2[Download to OS Temp]
 ```
 
 ## Core Components
 
 ### 1. Slack Client Module (`src/slack-client.ts`)
+
 **Purpose**: Handle all Slack API interactions with cookie authentication
 
 **Key Features**:
+
 - Cookie-based authentication handler
 - HTTP client configuration with proper headers
 - Rate limiting and retry logic
 - Error handling for API responses
 
 **Methods**:
+
 - `authenticate()`: Validate cookie and get workspace info
 - `sendMessage()`: Send messages to channels/DMs
 - `updateMessage()`: Edit existing messages
@@ -72,28 +80,28 @@ graph TB
 - `scheduleMessage()`: Schedule messages using Slack API
 - `fetchMessages()`: Retrieve messages from channels/threads
 - `addReaction()`: Add emoji reactions to messages
-- `listReminders()`: Get all user reminders
-- `createReminder()`: Create new reminders
-- `completeReminder()`: Mark reminders as done
-- `deleteReminder()`: Remove reminders
 - `searchMessages()`: Search for messages across workspace
+- `getFileInfo()`: Retrieve Slack file metadata
+- `downloadFile()`: Download a validated Slack-hosted file atomically to OS temp
 - `getUserInfo()`: Get user information
 - `getChannelInfo()`: Get channel information
 
 ### 2. Tool Handlers (`src/tools/`)
 
 #### a. Message Tools (`message-tools.ts`)
+
 - **send_message**: Send messages to channels or DMs
 - **reply_to_thread**: Reply to a specific thread
-- **send_direct_message**: Send a DM to a user
+- **send_direct_message**: Send by ID/exact username or return readable candidates for a name
 - **edit_message**: Edit previously sent messages
 - **delete_message**: Delete previously sent messages
 
 **Input Parameters**:
+
 ```typescript
 {
   channel?: string;        // Channel ID or name
-  user?: string;           // User ID for DMs
+  user?: string;           // User ID, exact @username, or human-readable name
   text: string;            // Message content
   thread_ts?: string;      // Thread timestamp for replies
   blocks?: Array<Block>;   // Rich formatting (optional)
@@ -101,9 +109,11 @@ graph TB
 ```
 
 #### b. Scheduling Tools (`schedule-tools.ts`)
+
 - **schedule_message**: Schedule a message for future delivery
 
 **Input Parameters**:
+
 ```typescript
 {
   channel: string;         // Channel ID
@@ -114,10 +124,12 @@ graph TB
 ```
 
 #### c. Fetch Tools (`fetch-tools.ts`)
+
 - **fetch_channel_messages**: Get recent messages from a channel
 - **fetch_thread_messages**: Get all messages from a specific thread
 
 **Input Parameters**:
+
 ```typescript
 {
   channel: string;         // Channel ID
@@ -129,6 +141,7 @@ graph TB
 ```
 
 **Output Format**:
+
 ```typescript
 {
   messages: Array<{
@@ -147,21 +160,25 @@ graph TB
 ```
 
 #### d. Reaction Tools (`reaction-tools.ts`)
+
 - **add_reaction**: Add an emoji reaction to a message
 
 **Input Parameters**:
+
 ```typescript
 {
-  channel: string;         // Channel ID
-  timestamp: string;       // Message timestamp
-  reaction: string;        // Emoji name (without colons)
+  channel: string; // Channel ID
+  timestamp: string; // Message timestamp
+  reaction: string; // Emoji name (without colons)
 }
 ```
 
 #### e. Search Tools (`search-tools.ts`)
+
 - **search_messages**: Search for messages across all channels
 
 **Input Parameters**:
+
 ```typescript
 {
   query: string;           // Search query with optional modifiers
@@ -174,6 +191,7 @@ graph TB
 ```
 
 **Search Query Modifiers**:
+
 - `from:@username` - Messages from specific user
 - `in:#channel` - Messages in specific channel
 - `has:link` - Messages with links
@@ -183,6 +201,7 @@ graph TB
 - `after:YYYY-MM-DD` - Messages after date
 
 **Output Format**:
+
 ```typescript
 {
   messages: Array<{
@@ -200,48 +219,30 @@ graph TB
       count: number;
     }>;
   }>;
-  message_count: number;   // Results on current page
-  total_count: number;     // Total matching messages
-  page: number;            // Current page number
-  page_count: number;      // Total pages
+  message_count: number; // Results on current page
+  total_count: number; // Total matching messages
+  page: number; // Current page number
+  page_count: number; // Total pages
 }
 ```
 
-#### f. Reminder Tools (`reminder-tools.ts`)
-- **list_reminders**: List all active reminders
-- **create_reminder**: Create new reminders
-- **complete_reminder**: Mark reminders as completed
-- **delete_reminder**: Remove reminders
+#### f. File Tools (`file-tools.ts`)
 
-**Input Parameters (create_reminder)**:
-```typescript
-{
-  text: string;            // Reminder text (max 1000 chars)
-  time: number;            // Unix timestamp (seconds)
-  user?: string;           // User ID (optional, defaults to self)
-}
-```
+- **get_file_info**: Return safe file metadata without private download URLs
+- **download_file**: Download eligible Slack-hosted files under the OS temp directory
 
-**Output Format (list_reminders)**:
-```typescript
-{
-  reminders: Array<{
-    id: string;
-    text: string;
-    time: number;
-    time_formatted: string;
-    user: string;
-    user_name?: string;
-    recurring: boolean;
-    completed: boolean;
-  }>;
-  reminder_count: number;
-}
-```
+File downloads use an exclusive 20 MiB limit. Images are enabled by default;
+videos and other files require explicit opt-in. External files remain
+metadata-only. Redirects are followed manually, limited to five hops, and must
+remain HTTPS URLs on Slack-owned hosts. Authentication and file downloads retry
+only transient failures, with a maximum of three attempts.
+Completed MCP-owned temp downloads are retained for seven days and abandoned
+partial files for one hour; cleanup is lazy and runs only when downloading.
 
 ### 3. Utilities (`src/utils/`)
 
 #### a. Validation (`validation.ts`)
+
 - Channel ID/name validation
 - User ID validation
 - Timestamp format validation
@@ -249,12 +250,14 @@ graph TB
 - Message length validation
 
 #### b. Formatters (`formatters.ts`)
+
 - Convert Slack message objects to readable text
 - Format timestamps to human-readable dates
 - Handle mentions, channels, and special formatting
 - Create markdown-friendly output for AI processing
 
 #### c. Error Handling (`errors.ts`)
+
 - Custom error classes for different scenarios
 - Slack API error mapping
 - User-friendly error messages
@@ -263,24 +266,28 @@ graph TB
 ## Security Considerations
 
 ### 1. Cookie Storage
+
 - Store cookie in environment variable (`SLACK_COOKIE_D`)
 - Never log or expose the cookie value
 - Validate cookie format before use
 - Clear instructions for users on secure cookie extraction
 
 ### 2. API Rate Limiting
+
 - Implement exponential backoff for rate limits
 - Respect Slack's rate limit headers
 - Queue requests if necessary
 - Log rate limit warnings
 
 ### 3. Input Validation
+
 - Sanitize all user inputs
 - Validate channel/user IDs format
 - Limit message lengths
 - Prevent injection attacks
 
 ### 4. Error Information
+
 - Don't expose sensitive data in error messages
 - Sanitize error responses
 - Log detailed errors internally only
@@ -288,6 +295,7 @@ graph TB
 ## API Endpoints Used
 
 ### Web API Endpoints (with cookie auth)
+
 - `POST /api/chat.postMessage` - Send messages
 - `POST /api/chat.scheduleMessage` - Schedule messages
 - `GET /api/conversations.history` - Fetch channel messages
@@ -295,38 +303,34 @@ graph TB
 - `POST /api/reactions.add` - Add reactions
 - `POST /api/chat.update` - Edit messages
 - `POST /api/chat.delete` - Delete messages
-- `GET /api/reminders.list` - List reminders
-- `POST /api/reminders.add` - Create reminders
-- `POST /api/reminders.complete` - Complete reminders
-- `POST /api/reminders.delete` - Delete reminders
 - `GET /api/search.messages` - Search messages
-- `GET /api/conversations.list` - List channels
+- `GET /api/files.info` - Fetch file metadata and private download location
 - `GET /api/users.list` - List users
 - `POST /api/auth.test` - Validate authentication
 
 ## Configuration
 
 ### Environment Variables
+
 ```bash
 SLACK_COOKIE_D=xoxd-...         # Required: Slack session cookie
-SLACK_WORKSPACE_ID=T...          # Optional: Workspace ID for validation
-SLACK_USER_ID=U...               # Optional: User ID for validation
-LOG_LEVEL=info                   # Optional: Logging level
+SLACK_WORKSPACE_URL=https://workspace.slack.com  # Required
+SLACK_RESPONSE_FORMAT=toon       # Optional: toon or json
+LOG_LEVEL=info                   # Optional: debug, info, warn, or error
 ```
 
 ### MCP Settings Configuration
+
 ```json
 {
   "mcpServers": {
     "slack": {
       "command": "node",
-      "args": ["/path/to/slack-mcp/build/index.js"],
+      "args": ["/path/to/slack-local-mcp/build/index.js"],
       "env": {
-        "SLACK_COOKIE_D": "user-slack-d-cookie"
-      },
-      "disabled": false,
-      "alwaysAllow": [],
-      "disabledTools": []
+        "SLACK_COOKIE_D": "user-slack-d-cookie",
+        "SLACK_WORKSPACE_URL": "https://workspace.slack.com"
+      }
     }
   }
 }
@@ -335,40 +339,32 @@ LOG_LEVEL=info                   # Optional: Logging level
 ## Project Structure
 
 ```
-slack-mcp/
+slack-local-mcp/
 ├── package.json
 ├── tsconfig.json
-├── .eslintrc.cjs
-├── .prettierrc.json
-├── README.md
-├── ARCHITECTURE.md
+├── eslint.config.cjs
+├── scripts/
+│   └── start-windows.mjs        # Lazy Windows environment launcher
 ├── src/
 │   ├── index.ts                 # Main MCP server entry point
+│   ├── config.ts                # First-use runtime configuration
+│   ├── lazy-slack-client.ts     # Shared lazy initialization
 │   ├── slack-client.ts          # Slack API client
 │   ├── types.ts                 # TypeScript type definitions
-│   ├── tools/
-│   │   ├── index.ts             # Tool exports
-│   │   ├── message-tools.ts     # Message sending/editing/deleting tools
-│   │   ├── schedule-tools.ts    # Message scheduling tools
-│   │   ├── fetch-tools.ts       # Message fetching tools
-│   │   ├── reaction-tools.ts    # Reaction tools
-│   │   ├── reminder-tools.ts    # Reminder management tools
-│   │   ├── search-tools.ts      # Message search tools
-│   │   └── user-tools.ts        # User search tools
-│   └── utils/
-│       ├── validation.ts        # Input validation
-│       ├── formatters.ts        # Message formatting
-│       ├── errors.ts            # Error handling
-│       └── logger.ts            # Logging utility
+│   ├── tools/                   # Tool definitions and handlers by feature
+│   └── utils/                   # Validation, formatting, downloads, errors, logging
+├── test/                        # Offline unit and MCP boundary tests
 └── build/                       # Compiled JavaScript output
 ```
 
 ## Tool Specifications
 
 ### 1. send_message
+
 **Description**: Send a message to a Slack channel or direct message
 
 **Parameters**:
+
 - `channel` (string, required): Channel ID (C...) or channel name
 - `text` (string, required): Message content (max 40,000 chars)
 - `thread_ts` (string, optional): Thread timestamp to reply to
@@ -379,21 +375,27 @@ slack-mcp/
 ---
 
 ### 2. send_direct_message
-**Description**: Send a direct message to a specific user
+
+**Description**: Send a direct message or return recipient candidates without sending
 
 **Parameters**:
-- `user` (string, required): User ID (U...) or username
+
+- `user` (string, required): User ID, exact `@username`, or human-readable name
 - `text` (string, required): Message content
 - `thread_ts` (string, optional): Thread timestamp if continuing conversation
 
-**Returns**: Message timestamp and conversation ID
+**Returns**: Message timestamp and conversation ID, or up to five candidates
+with `search_complete` and `next_cursor`. Plain names always require candidate
+selection; ordinary resolution scans at most three user-list pages.
 
 ---
 
 ### 3. reply_to_thread
+
 **Description**: Reply to a specific thread in a channel
 
 **Parameters**:
+
 - `channel` (string, required): Channel ID
 - `thread_ts` (string, required): Parent message timestamp
 - `text` (string, required): Reply content
@@ -404,9 +406,11 @@ slack-mcp/
 ---
 
 ### 4. edit_message
+
 **Description**: Edit a previously sent message
 
 **Parameters**:
+
 - `channel` (string, required): Channel ID
 - `timestamp` (string, required): Message timestamp to edit
 - `text` (string, required): New message content
@@ -416,9 +420,11 @@ slack-mcp/
 ---
 
 ### 5. delete_message
+
 **Description**: Delete a previously sent message
 
 **Parameters**:
+
 - `channel` (string, required): Channel ID
 - `timestamp` (string, required): Message timestamp to delete
 
@@ -427,9 +433,11 @@ slack-mcp/
 ---
 
 ### 6. schedule_message
+
 **Description**: Schedule a message to be sent at a future time
 
 **Parameters**:
+
 - `channel` (string, required): Channel ID
 - `text` (string, required): Message content
 - `post_at` (number, required): Unix timestamp for delivery
@@ -440,10 +448,12 @@ slack-mcp/
 ---
 
 ### 7. fetch_channel_messages
+
 **Description**: Fetch recent messages from a channel for summarization
 
 **Parameters**:
-- `channel` (string, required): Channel ID or name
+
+- `channel` (string, required): Slack conversation ID beginning with C, G, or D
 - `limit` (number, optional): Number of messages to fetch (default: 50, max: 200)
 - `oldest` (string, optional): Oldest timestamp to include
 - `latest` (string, optional): Latest timestamp to include
@@ -453,9 +463,11 @@ slack-mcp/
 ---
 
 ### 8. fetch_thread_messages
+
 **Description**: Fetch all messages from a specific thread
 
 **Parameters**:
+
 - `channel` (string, required): Channel ID
 - `thread_ts` (string, required): Thread parent timestamp
 - `limit` (number, optional): Max messages (default: 100, max: 200)
@@ -465,9 +477,11 @@ slack-mcp/
 ---
 
 ### 9. add_reaction
+
 **Description**: Add an emoji reaction to a message
 
 **Parameters**:
+
 - `channel` (string, required): Channel ID
 - `timestamp` (string, required): Message timestamp
 - `reaction` (string, required): Emoji name without colons (e.g., "thumbsup")
@@ -476,51 +490,12 @@ slack-mcp/
 
 ---
 
-### 10. list_reminders
-**Description**: List all active reminders for the user
+### 10. search_messages
 
-**Parameters**: None
-
-**Returns**: Array of reminders with formatted text
-
----
-
-### 11. create_reminder
-**Description**: Create a new reminder
-
-**Parameters**:
-- `text` (string, required): Reminder text (max 1000 chars)
-- `time` (number, required): Unix timestamp in seconds
-- `user` (string, optional): User ID to set reminder for
-
-**Returns**: Reminder ID and scheduled time
-
----
-
-### 12. complete_reminder
-**Description**: Mark a reminder as completed
-
-**Parameters**:
-- `reminder_id` (string, required): Reminder ID
-
-**Returns**: Success confirmation
-
----
-
-### 13. delete_reminder
-**Description**: Delete a reminder permanently
-
-**Parameters**:
-- `reminder_id` (string, required): Reminder ID
-
-**Returns**: Success confirmation
-
----
-
-### 14. search_messages
 **Description**: Search for messages across all channels in the workspace
 
 **Parameters**:
+
 - `query` (string, required): Search query with optional modifiers
   - Supports: `from:@user`, `in:#channel`, `has:link`, `before:YYYY-MM-DD`, `after:YYYY-MM-DD`
 - `count` (number, optional): Results per page (1-100, default: 20)
@@ -532,6 +507,7 @@ slack-mcp/
 **Returns**: Array of matching messages with pagination info
 
 **Examples**:
+
 - Basic: `"project deadline"`
 - User filter: `"from:@john urgent"`
 - Channel filter: `"in:#general meeting notes"`
@@ -540,9 +516,21 @@ slack-mcp/
 
 ---
 
+### 11. search_users
+
+**Description**: Search users by username, display name, or real name without
+requiring a full workspace scan on every call.
+
+Normal searches inspect at most three pages and return an opaque `next_cursor`
+when more users remain. `refresh_cache=true` is the explicit full-scan path. A
+cached miss falls through to a bounded live request so new users can be found.
+
+---
+
 ## Error Handling Strategy
 
 ### Error Types
+
 1. **Authentication Errors**: Invalid or expired cookie
 2. **Permission Errors**: Insufficient permissions for action
 3. **Not Found Errors**: Channel, user, or message not found
@@ -551,6 +539,7 @@ slack-mcp/
 6. **Network Errors**: Connection or timeout issues
 
 ### Error Response Format
+
 ```typescript
 {
   content: [{
@@ -564,30 +553,38 @@ slack-mcp/
 ## Implementation Best Practices
 
 ### 1. Type Safety
+
 - Use TypeScript strict mode
 - Define interfaces for all API responses
 - Use Zod for runtime validation
 - No `any` types
 
 ### 2. Code Organization
+
 - Single Responsibility Principle
 - Separate concerns (API client, tools, utils)
 - Modular and testable code
 - Clear function naming
 
 ### 3. Performance
+
 - Minimize API calls
-- Implement caching where appropriate
+- Use a one-hour, workspace-specific, atomically replaced complete user cache
+- Bound ordinary user searches to three pages and expose continuation cursors
+- Treat cached misses as hints and perform a bounded live check for new users
+- Bound previously unseen user lookups to eight concurrent Slack requests
 - Use pagination for large datasets
 - Async/await for all I/O operations
 
 ### 4. Reliability
+
 - Retry logic for transient failures
 - Graceful degradation
 - Comprehensive error logging
 - Clear error messages for users
 
 ### 5. Maintainability
+
 - Extensive JSDoc comments
 - README with setup instructions
 - Examples for each tool
@@ -595,7 +592,27 @@ slack-mcp/
 
 ## Testing Strategy
 
+The default suite is offline and deterministic. The opt-in `npm run test:live`
+suite uses the MCP stdio boundary, requires an exact authenticated-self name
+check before writes, targets only the resulting self-DM, and performs cleanup
+from `finally`. It contains no fallback channel or user ID. Scheduled-message
+testing is separately opt-in and cancels a successful schedule immediately.
+
+The default MCP registry has 12 live-verified tools. `schedule_message` is
+excluded unless `SLACK_ENABLE_SCHEDULE_MESSAGE=1` is present directly in the
+server process environment because cookie-token validation returned
+`not_allowed_token_type`. The flag is process-only so `listTools` does not need
+to read HKCU or contact Slack.
+
+The four tools backed by Slack's legacy `reminders.*` Web APIs were removed in
+August 2026 rather than retained behind a compatibility flag. Slack began
+retiring those methods in March 2023 and documents them as deprecated and
+degraded; live validation also produced an unobservable reminder ID. This does
+not remove Slack's user-facing reminder UI or `/remind`. Supported alternatives
+are Slack Later/reminders and Workflow scheduled triggers.
+
 ### Manual Testing Checklist
+
 1. Cookie authentication validation
 2. Send message to channel
 3. Send direct message to user
@@ -606,15 +623,20 @@ slack-mcp/
 8. Fetch channel messages with different limits
 9. Fetch thread messages
 10. Add reactions to messages
-11. List reminders
-12. Create reminder
-13. Complete reminder
-14. Delete reminder
-15. Search messages with various filters
+11. Search messages with various filters
+12. Fetch file metadata without exposing private URLs
+13. Download an eligible image to OS temp
+14. Skip video/other files unless explicitly enabled
+15. Reject files at or above 20 MiB
 16. Error handling for invalid inputs
-17. Rate limit handling
+17. Rate limit and transient network retry handling
+18. Lazy configuration without registry or Slack startup I/O
+19. Slack-only workspace/token redirect validation
+20. Top-level MCP `isError` propagation and expired-token recovery
+21. Cancellation, bounded user lookup concurrency, cache expiry, and temp cleanup
 
 ### Test Scenarios
+
 - Valid and invalid channel IDs
 - Valid and invalid user IDs
 - Empty messages
@@ -627,6 +649,7 @@ slack-mcp/
 ## Future Enhancements
 
 ### Phase 2 Features
+
 - OAuth 2.0 token support
 - Bot token support
 - Multi-workspace management
@@ -636,6 +659,7 @@ slack-mcp/
 - Pin/bookmark management
 
 ### Phase 3 Features
+
 - Slack Events API integration
 - Real-time message monitoring
 - Custom emoji support
@@ -646,12 +670,14 @@ slack-mcp/
 ## Dependencies
 
 ### Core Dependencies
+
 - `@modelcontextprotocol/sdk`: MCP SDK for server implementation
 - `axios`: HTTP client for Slack API calls
 - `zod`: Runtime type validation
 - `typescript`: Type safety
 
 ### Development Dependencies
+
 - `@typescript-eslint/parser`: TypeScript linting
 - `@typescript-eslint/eslint-plugin`: ESLint rules
 - `eslint`: Code linting
@@ -661,6 +687,7 @@ slack-mcp/
 ## Documentation Deliverables
 
 ### 1. README.md
+
 - Quick start guide
 - How to extract Slack cookie
 - Configuration instructions
@@ -668,16 +695,11 @@ slack-mcp/
 - Troubleshooting guide
 
 ### 2. ARCHITECTURE.md (this document)
+
 - System design
 - Component descriptions
 - API specifications
 - Security considerations
-
-### 3. SETUP_GUIDE.md
-- Step-by-step cookie extraction
-- MCP configuration
-- Testing the server
-- Common issues and solutions
 
 ## Success Criteria
 
@@ -685,11 +707,12 @@ slack-mcp/
 2. ✅ Send messages to channels and DMs
 3. ✅ Reply to threads
 4. ✅ Edit and delete messages
-5. ✅ Schedule messages using native Slack API
+5. ✅ Report native scheduling support or token-type rejection accurately
 6. ✅ Fetch and format messages for AI summarization
 7. ✅ Add emoji reactions to messages
-8. ✅ Manage reminders (list, create, complete, delete)
-9. ✅ Comprehensive error handling
-10. ✅ Security best practices implemented
-11. ✅ Clear documentation for users
-12. ✅ Working MCP server integration
+8. ✅ Remove integrations backed by retired Slack reminder APIs
+9. ✅ Inspect message attachments and download policy-approved Slack files
+10. ✅ Comprehensive error handling
+11. ✅ Security best practices implemented
+12. ✅ Clear documentation for users
+13. ✅ Working MCP server integration

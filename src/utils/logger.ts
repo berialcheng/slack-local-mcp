@@ -3,7 +3,7 @@
  * Never logs sensitive information like cookies or tokens
  */
 
-import { LogLevel } from '../types.js';
+import type { LogLevel } from '../types.js';
 
 export class Logger {
   private level: LogLevel;
@@ -37,11 +37,13 @@ export class Logger {
    */
   private sanitize(data: unknown): unknown {
     if (typeof data === 'string') {
-      // Redact cookie values
-      if (data.startsWith('xoxd-') || data.startsWith('xoxb-') || data.startsWith('xoxa-')) {
-        return '[REDACTED_TOKEN]';
-      }
-      return data;
+      return data
+        .replace(/\bxox[a-z]-[a-z0-9%._-]+/gi, '[REDACTED_SLACK_TOKEN]')
+        .replace(/\bBearer\s+[^\s"'<>]+/gi, 'Bearer [REDACTED]')
+        .replace(
+          /https:\/\/(?:[a-z0-9-]+\.)*slack\.com\/files-pri\/[^\s"'<>]+/gi,
+          '[REDACTED_SLACK_FILE_URL]',
+        );
     }
 
     if (Array.isArray(data)) {
@@ -52,9 +54,11 @@ export class Logger {
       const sanitized: Record<string, unknown> = {};
       for (const [key, value] of Object.entries(data)) {
         // Redact known sensitive keys
-        if (['cookie', 'token', 'authorization', 'password', 'secret'].some(
-          (sensitive) => key.toLowerCase().includes(sensitive)
-        )) {
+        if (
+          ['cookie', 'token', 'authorization', 'password', 'secret'].some((sensitive) =>
+            key.toLowerCase().includes(sensitive),
+          )
+        ) {
           sanitized[key] = '[REDACTED]';
         } else {
           sanitized[key] = this.sanitize(value);
@@ -115,7 +119,7 @@ export class Logger {
   error(message: string, error?: unknown): void {
     if (this.shouldLog('error')) {
       let errorData: unknown = error;
-      
+
       if (error instanceof Error) {
         errorData = {
           name: error.name,
@@ -123,13 +127,11 @@ export class Logger {
           stack: error.stack,
         };
       }
-      
+
       console.error(this.format('error', message, errorData));
     }
   }
 }
 
 // Export singleton instance
-export const logger = new Logger(
-  (process.env.LOG_LEVEL as LogLevel) || 'info'
-);
+export const logger = new Logger((process.env.LOG_LEVEL as LogLevel) || 'info');

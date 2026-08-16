@@ -3,9 +3,11 @@
  */
 
 import { z } from 'zod';
-import { SlackClient, UserRecord } from '../slack-client.js';
+
+import type { SlackClient, UserRecord } from '../slack-client.js';
 import { logger } from '../utils/logger.js';
-import { handleSlackError, formatErrorForMCP } from '../utils/errors.js';
+
+const USER_SEARCH_MAX_PAGES = 3;
 
 /**
  * Tool: search_users
@@ -13,16 +15,44 @@ import { handleSlackError, formatErrorForMCP } from '../utils/errors.js';
  */
 export const searchUsersTool = {
   name: 'search_users',
-  description: 'Search for Slack users by name (display name, real name, or username). Returns multiple matches if found, helping you identify the correct user when names are ambiguous. Use this before sending direct messages to ensure you have the right person.',
+  description:
+    'Search for Slack users by name (display name, real name, or username). Returns multiple matches if found, helping you identify the correct user when names are ambiguous. Use this before sending direct messages to ensure you have the right person.',
   inputSchema: z.object({
-    query: z.string().min(1).describe('Search query (name, display name, or username to search for)'),
-    limit: z.number().optional().default(10).describe('Maximum number of results to return (default: 10)'),
+    query: z
+      .string()
+      .min(1)
+      .max(100)
+      .describe('Search query (name, display name, or username to search for)'),
+    limit: z
+      .number()
+      .int()
+      .min(1)
+      .max(100)
+      .optional()
+      .default(5)
+      .describe('Maximum number of results to return (default: 5, max: 100)'),
+    refresh_cache: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe(
+        'Explicitly rebuild the complete user cache from Slack. This may be slow for large workspaces (default: false).',
+      ),
+    cursor: z
+      .string()
+      .trim()
+      .min(1)
+      .max(1000)
+      .optional()
+      .describe('Opaque next_cursor returned by an incomplete prior search'),
   }),
 };
 
 export interface SearchUsersInput {
   query: string;
   limit?: number;
+  refresh_cache?: boolean;
+  cursor?: string;
 }
 
 export interface UserSearchResult {
@@ -39,6 +69,8 @@ export interface SearchUsersOutput {
   match_count: number;
   source: 'cache' | 'api';
   exhaustive: boolean;
+  scanned_users: number;
+  next_cursor?: string;
 }
 
 /**
@@ -63,9 +95,9 @@ function levenshteinDistance(str1: string, str2: string): number {
     for (let j = 1; j <= len2; j++) {
       const cost = str1[i - 1] === str2[j - 1] ? 0 : 1;
       matrix[i][j] = Math.min(
-        matrix[i - 1][j] + 1,      // deletion
-        matrix[i][j - 1] + 1,      // insertion
-        matrix[i - 1][j - 1] + cost // substitution
+        matrix[i - 1][j] + 1, // deletion
+        matrix[i][j - 1] + 1, // insertion
+        matrix[i - 1][j - 1] + cost, // substitution
       );
     }
   }
@@ -89,7 +121,7 @@ function similarityScore(query: string, target: string): number {
 
   if (distance <= threshold) {
     // Return score based on how close the match is
-    return 50 - (distance * 10); // 50 for 1 char diff, 40 for 2 char diff
+    return 50 - distance * 10; // 50 for 1 char diff, 40 for 2 char diff
   }
 
   return 0;
@@ -117,18 +149,26 @@ export function createUserScoreFn(cleanQuery: string): (user: UserRecord) => num
       return 95;
     }
     // Starts with query (exact or normalized)
-    if (name.startsWith(cleanQuery) || displayName.startsWith(cleanQuery) || realName.startsWith(cleanQuery)) {
+    if (
+      name.startsWith(cleanQuery) ||
+      displayName.startsWith(cleanQuery) ||
+      realName.startsWith(cleanQuery)
+    ) {
       return 80;
     }
     if (normalizedName.startsWith(normalizedQuery)) {
       return 75;
     }
     // Word boundary match in real name
-    if (realName.split(' ').some(word => word.startsWith(cleanQuery))) {
+    if (realName.split(' ').some((word) => word.startsWith(cleanQuery))) {
       return 70;
     }
     // Contains query (exact or normalized)
-    if (name.includes(cleanQuery) || displayName.includes(cleanQuery) || realName.includes(cleanQuery)) {
+    if (
+      name.includes(cleanQuery) ||
+      displayName.includes(cleanQuery) ||
+      realName.includes(cleanQuery)
+    ) {
       return 60;
     }
     if (normalizedName.includes(normalizedQuery)) {
@@ -151,47 +191,47 @@ export function createUserScoreFn(cleanQuery: string): (user: UserRecord) => num
 
 export async function handleSearchUsers(
   input: SearchUsersInput,
-  client: SlackClient
-): Promise<SearchUsersOutput | string | ReturnType<typeof formatErrorForMCP>> {
-  try {
-    // Clean and normalize query
-    let cleanQuery = input.query.trim().replace(/^@/, '').toLowerCase();
+  client: SlackClient,
+): Promise<SearchUsersOutput | string> {
+  // Clean and normalize query
+  let cleanQuery = input.query.trim().replace(/^@/, '').toLowerCase();
 
-    if (!cleanQuery) {
-      return 'Search query cannot be empty.';
-    }
-
-    // Strip common email/domain suffixes
-    cleanQuery = cleanQuery.replace(/[-@][a-z0-9-]+\.(com|net|org|io|dev)$/i, '');
-
-    const limit = input.limit || 10;
-
-    logger.info('Searching for users', { query: cleanQuery, originalQuery: input.query, limit });
-
-    const scoreFn = createUserScoreFn(cleanQuery);
-    const searchResult = await client.searchUsersIncremental(scoreFn, limit);
-
-    const results: UserSearchResult[] = searchResult.results.map((user) => ({
-      id: user.id,
-      name: user.name,
-      display_name: user.display_name || user.name,
-      real_name: user.real_name || user.name,
-    }));
-
-    if (results.length === 0) {
-      return `No users found matching "${input.query}".`;
-    }
-
-    return {
-      query: input.query,
-      results,
-      match_count: results.length,
-      source: searchResult.source,
-      exhaustive: searchResult.exhaustive,
-    };
-  } catch (error) {
-    logger.error('Failed to search users', error);
-    const slackError = handleSlackError(error, 'search_users');
-    return formatErrorForMCP(slackError);
+  if (!cleanQuery) {
+    return 'Search query cannot be empty.';
   }
+
+  // Strip common email/domain suffixes
+  cleanQuery = cleanQuery.replace(/[-@][a-z0-9-]+\.(com|net|org|io|dev)$/i, '');
+
+  const limit = input.limit || 5;
+
+  logger.info('Searching for users', { query: cleanQuery, originalQuery: input.query, limit });
+
+  const scoreFn = createUserScoreFn(cleanQuery);
+  const cursor = input.cursor?.trim() || undefined;
+  const forceFullScan = Boolean(input.refresh_cache && !cursor);
+  const searchResult = await client.searchUsersIncremental(scoreFn, limit, {
+    earlyStopThreshold: 80,
+    skipCache: Boolean(input.refresh_cache || cursor),
+    forceFullScan,
+    maxPages: forceFullScan ? undefined : USER_SEARCH_MAX_PAGES,
+    cursor,
+  });
+
+  const results: UserSearchResult[] = searchResult.results.map((user) => ({
+    id: user.id,
+    name: user.name,
+    display_name: user.display_name || user.name,
+    real_name: user.real_name || user.name,
+  }));
+
+  return {
+    query: input.query,
+    results,
+    match_count: results.length,
+    source: searchResult.source,
+    exhaustive: searchResult.exhaustive,
+    scanned_users: searchResult.scannedUsers,
+    next_cursor: searchResult.nextCursor,
+  };
 }

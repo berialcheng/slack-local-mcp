@@ -28,6 +28,29 @@ export interface SlackAuthTestResponse extends SlackApiResponse {
 // Message Types
 // ============================================================================
 
+export interface SlackFile {
+  id: string;
+  created?: number;
+  timestamp?: number;
+  name?: string;
+  title?: string;
+  mimetype?: string;
+  filetype?: string;
+  pretty_type?: string;
+  user?: string;
+  size?: number;
+  mode?: string;
+  is_external?: boolean;
+  external_type?: string;
+  url_private?: string;
+  url_private_download?: string;
+  permalink?: string;
+  original_w?: number;
+  original_h?: number;
+  alt_txt?: string;
+  file_access?: string;
+}
+
 export interface SlackMessage {
   type: string;
   user?: string;
@@ -46,6 +69,7 @@ export interface SlackMessage {
   app_id?: string;
   attachments?: unknown[];
   blocks?: unknown[];
+  files?: SlackFile[];
 }
 
 export interface SlackReaction {
@@ -60,6 +84,11 @@ export interface SlackMessageResponse extends SlackApiResponse {
   message: SlackMessage;
 }
 
+export interface SlackFilesInfoResponse extends SlackApiResponse {
+  file?: SlackFile;
+  comments?: unknown[];
+}
+
 export interface SlackScheduledMessageResponse extends SlackApiResponse {
   channel: string;
   scheduled_message_id: string;
@@ -70,42 +99,9 @@ export interface SlackScheduledMessageResponse extends SlackApiResponse {
   };
 }
 
-export interface SlackReminder {
-  id: string;
-  creator: string;
-  user: string;
-  text: string;
-  recurring: boolean;
-  time: number;
-  complete_ts: number;
-}
-
-export interface SlackRemindersListResponse extends SlackApiResponse {
-  reminders: SlackReminder[];
-}
-
-export interface SlackReminderResponse extends SlackApiResponse {
-  reminder: SlackReminder;
-}
-
 // ============================================================================
 // Conversation Types
 // ============================================================================
-
-export interface SlackConversation {
-  id: string;
-  name?: string;
-  is_channel: boolean;
-  is_group: boolean;
-  is_im: boolean;
-  is_mpim: boolean;
-  is_private: boolean;
-  created: number;
-  is_archived: boolean;
-  is_general: boolean;
-  is_member: boolean;
-  num_members?: number;
-}
 
 export interface SlackConversationsHistoryResponse extends SlackApiResponse {
   messages: SlackMessage[];
@@ -119,13 +115,6 @@ export interface SlackConversationsHistoryResponse extends SlackApiResponse {
 export interface SlackConversationsRepliesResponse extends SlackApiResponse {
   messages: SlackMessage[];
   has_more: boolean;
-  response_metadata?: {
-    next_cursor: string;
-  };
-}
-
-export interface SlackConversationsListResponse extends SlackApiResponse {
-  channels: SlackConversation[];
   response_metadata?: {
     next_cursor: string;
   };
@@ -156,13 +145,14 @@ export interface SlackSearchMessage {
   team?: string;
   iid?: string;
   reactions?: SlackReaction[];
+  files?: SlackFile[];
 }
 
 export interface SlackSearchMessagesResponse extends SlackApiResponse {
   query: string;
   messages: {
     total: number;
-    pagination: {
+    pagination?: {
       total_count: number;
       page: number;
       per_page: number;
@@ -218,9 +208,8 @@ export interface SlackUsersInfoResponse extends SlackApiResponse {
 // Reaction Types
 // ============================================================================
 
-export interface SlackReactionsAddResponse extends SlackApiResponse {
-  // Successfully added reaction returns basic response
-}
+// Successfully adding a reaction returns only the basic Slack API response.
+export type SlackReactionsAddResponse = SlackApiResponse;
 
 // ============================================================================
 // Tool Input Types
@@ -283,20 +272,6 @@ export interface AddReactionInput {
   reaction: string;
 }
 
-export interface CreateReminderInput {
-  text: string;
-  time: number;
-  user?: string;
-}
-
-export interface CompleteReminderInput {
-  reminder_id: string;
-}
-
-export interface DeleteReminderInput {
-  reminder_id: string;
-}
-
 export interface SearchMessagesInput {
   query: string;
   count?: number;
@@ -304,6 +279,16 @@ export interface SearchMessagesInput {
   sort?: 'score' | 'timestamp';
   sort_dir?: 'asc' | 'desc';
   highlight?: boolean;
+}
+
+export interface GetFileInfoInput {
+  file: string;
+}
+
+export interface DownloadFileInput {
+  file: string;
+  allow_video?: boolean;
+  allow_other?: boolean;
 }
 
 // ============================================================================
@@ -339,30 +324,67 @@ export interface FormattedMessage {
   reply_count?: number;
   reactions?: SlackReaction[];
   is_bot: boolean;
+  files?: FormattedSlackFile[];
+}
+
+export type SlackFileCategory = 'image' | 'video' | 'other';
+
+export interface FormattedSlackFile {
+  id: string;
+  name: string;
+  title: string;
+  mimetype: string;
+  filetype: string;
+  size: number | null;
+  mode: string;
+  category: SlackFileCategory;
+  permalink?: string;
+  original_w?: number;
+  original_h?: number;
+  alt_text?: string;
+  download_available: boolean;
+  download_eligible_by_default: boolean;
+}
+
+export interface FileDownloadPolicy {
+  max_bytes_exclusive: number;
+  max_size: string;
+  default_images: boolean;
+  default_videos: boolean;
+  default_other_files: boolean;
+}
+
+export interface FileInfoToolOutput {
+  file: FormattedSlackFile;
+  download_policy: FileDownloadPolicy;
+}
+
+export interface FileDownloadResult {
+  path: string;
+  bytes: number;
+  sha256: string;
+  content_type: string;
+  redirect_count: number;
+  final_host: string;
+}
+
+export interface DownloadFileToolOutput {
+  downloaded: boolean;
+  status: 'downloaded' | 'skipped';
+  file: FormattedSlackFile;
+  policy: FileDownloadPolicy;
+  reason?: string;
+  path?: string;
+  bytes?: number;
+  sha256?: string;
+  content_type?: string;
+  redirect_count?: number;
+  final_host?: string;
 }
 
 export interface ReactionToolOutput {
   success: boolean;
   message: string;
-}
-
-export interface ReminderToolOutput {
-  success: boolean;
-  reminder_id?: string;
-  message: string;
-}
-
-export interface RemindersListOutput {
-  reminders: FormattedReminder[];
-  reminder_count: number;
-}
-
-export interface FormattedReminder {
-  id: string;
-  text: string;
-  time: string; // ISO 8601 formatted (not raw number)
-  user: string; // User name (not ID)
-  status: 'pending' | 'recurring' | 'completed';
 }
 
 export interface SearchMessagesOutput {
@@ -382,6 +404,7 @@ export interface FormattedSearchMessage {
   permalink: string;
   thread_ts?: string;
   reactions?: SlackReaction[];
+  files?: FormattedSlackFile[];
 }
 
 // ============================================================================
@@ -413,7 +436,7 @@ export class SlackError extends Error {
     message: string,
     public code: string,
     public statusCode?: number,
-    public details?: unknown
+    public details?: unknown,
   ) {
     super(message);
     this.name = 'SlackError';
@@ -431,7 +454,7 @@ export class RateLimitError extends SlackError {
   constructor(
     message: string,
     public retryAfter: number,
-    details?: unknown
+    details?: unknown,
   ) {
     super(message, 'RATE_LIMIT', 429, details);
     this.name = 'RateLimitError';
@@ -456,5 +479,12 @@ export class PermissionError extends SlackError {
   constructor(message: string, details?: unknown) {
     super(message, 'PERMISSION_ERROR', 403, details);
     this.name = 'PermissionError';
+  }
+}
+
+export class CancelledError extends SlackError {
+  constructor(message: string = 'Operation cancelled', details?: unknown) {
+    super(message, 'CANCELLED', 499, details);
+    this.name = 'CancelledError';
   }
 }

@@ -2,6 +2,7 @@
  * Error handling utilities for the Slack MCP server
  */
 
+import type { SlackErrorResponse } from '../types.js';
 import {
   SlackError,
   AuthenticationError,
@@ -9,23 +10,47 @@ import {
   NotFoundError,
   ValidationError,
   PermissionError,
-  SlackErrorResponse,
+  CancelledError,
 } from '../types.js';
+
 import { logger } from './logger.js';
 
 /**
  * Map Slack API error codes to custom error classes
  */
-export function handleSlackError(
-  error: unknown,
-  context?: string
-): SlackError {
+export function handleSlackError(error: unknown, context?: string): SlackError {
+  if (
+    error instanceof Error &&
+    (error.name === 'AbortError' ||
+      (error as Error & { code?: string }).code === 'ERR_CANCELED' ||
+      (error as Error & { code?: string }).code === 'ABORT_ERR')
+  ) {
+    return new CancelledError(`Operation cancelled${context ? ` (${context})` : ''}`);
+  }
+
+  if (
+    error instanceof Error &&
+    error.name === 'ZodError' &&
+    'issues' in error &&
+    Array.isArray((error as Error & { issues?: unknown[] }).issues)
+  ) {
+    const issues = (error as Error & { issues: Array<{ path?: unknown[]; message?: string }> })
+      .issues;
+    const summary = issues
+      .slice(0, 5)
+      .map((issue) => `${issue.path?.join('.') || 'input'}: ${issue.message || 'invalid value'}`)
+      .join('; ');
+    return new ValidationError(`Invalid tool input${context ? ` (${context})` : ''}: ${summary}`, {
+      issues: issues.length,
+    });
+  }
+
   // Handle Axios errors
   if (error && typeof error === 'object' && 'response' in error) {
     const axiosError = error as {
       response?: {
         status: number;
-        data: SlackErrorResponse | string;
+        data: SlackErrorResponse | string | null;
         headers?: Record<string, string>;
       };
       message: string;
@@ -33,8 +58,9 @@ export function handleSlackError(
 
     const status = axiosError.response?.status;
     const data = axiosError.response?.data;
-    const errorCode = typeof data === 'object' ? data.error : undefined;
-    const errorMessage = typeof data === 'object' ? data.error : axiosError.message;
+    const slackErrorData = data !== null && typeof data === 'object' ? data : undefined;
+    const errorCode = slackErrorData?.error;
+    const errorMessage = slackErrorData?.error || axiosError.message;
 
     // Log the error for debugging
     logger.debug('Slack API error', {
@@ -49,19 +75,19 @@ export function handleSlackError(
       case 401:
         return new AuthenticationError(
           `Authentication failed${context ? ` (${context})` : ''}: ${errorMessage}`,
-          { errorCode, status }
+          { errorCode, status },
         );
 
       case 403:
         return new PermissionError(
           `Permission denied${context ? ` (${context})` : ''}: ${errorMessage}`,
-          { errorCode, status }
+          { errorCode, status },
         );
 
       case 404:
         return new NotFoundError(
           `Resource not found${context ? ` (${context})` : ''}: ${errorMessage}`,
-          { errorCode, status }
+          { errorCode, status },
         );
 
       case 429: {
@@ -70,57 +96,12 @@ export function handleSlackError(
         return new RateLimitError(
           `Rate limit exceeded${context ? ` (${context})` : ''}. Retry after ${retrySeconds} seconds.`,
           retrySeconds,
-          { errorCode, status }
+          { errorCode, status },
         );
       }
 
       default:
-        // Map common Slack error codes
-        switch (errorCode) {
-          case 'invalid_auth':
-          case 'account_inactive':
-          case 'token_revoked':
-          case 'no_permission':
-          case 'org_login_required':
-            return new AuthenticationError(
-              `Authentication error${context ? ` (${context})` : ''}: ${errorCode}`,
-              { errorCode, status }
-            );
-
-          case 'channel_not_found':
-          case 'user_not_found':
-          case 'message_not_found':
-          case 'thread_not_found':
-            return new NotFoundError(
-              `Not found${context ? ` (${context})` : ''}: ${errorCode}`,
-              { errorCode, status }
-            );
-
-          case 'not_in_channel':
-          case 'cannot_dm_bot':
-          case 'restricted_action':
-            return new PermissionError(
-              `Permission error${context ? ` (${context})` : ''}: ${errorCode}`,
-              { errorCode, status }
-            );
-
-          case 'invalid_arguments':
-          case 'invalid_channel':
-          case 'invalid_name':
-          case 'invalid_timestamp':
-            return new ValidationError(
-              `Validation error${context ? ` (${context})` : ''}: ${errorCode}`,
-              { errorCode, status }
-            );
-
-          default:
-            return new SlackError(
-              `Slack API error${context ? ` (${context})` : ''}: ${errorMessage}`,
-              errorCode || 'UNKNOWN_ERROR',
-              status,
-              { errorCode, status }
-            );
-        }
+        return mapSlackApiError(errorCode, errorMessage, context, status);
     }
   }
 
@@ -131,12 +112,15 @@ export function handleSlackError(
 
   // Handle generic errors
   if (error instanceof Error) {
+    if (/^[a-z][a-z0-9_]*$/i.test(error.message)) {
+      return mapSlackApiError(error.message, error.message, context);
+    }
     logger.error('Unexpected error', error);
     return new SlackError(
       `Unexpected error${context ? ` (${context})` : ''}: ${error.message}`,
       'INTERNAL_ERROR',
       undefined,
-      { originalError: error.message }
+      { originalError: error.message },
     );
   }
 
@@ -146,8 +130,70 @@ export function handleSlackError(
     `Unknown error${context ? ` (${context})` : ''}`,
     'UNKNOWN_ERROR',
     undefined,
-    { error }
+    { error },
   );
+}
+
+function mapSlackApiError(
+  errorCode: string | undefined,
+  errorMessage: string | undefined,
+  context?: string,
+  status?: number,
+): SlackError {
+  switch (errorCode) {
+    case 'invalid_auth':
+    case 'not_authed':
+    case 'account_inactive':
+    case 'token_expired':
+    case 'token_revoked':
+    case 'org_login_required':
+      return new AuthenticationError(
+        `Authentication error${context ? ` (${context})` : ''}: ${errorCode}`,
+        { errorCode, status },
+      );
+
+    case 'channel_not_found':
+    case 'user_not_found':
+    case 'message_not_found':
+    case 'thread_not_found':
+    case 'file_not_found':
+      return new NotFoundError(`Not found${context ? ` (${context})` : ''}: ${errorCode}`, {
+        errorCode,
+        status,
+      });
+
+    case 'no_permission':
+    case 'not_in_channel':
+    case 'cannot_dm_bot':
+    case 'restricted_action':
+      return new PermissionError(
+        `Permission error${context ? ` (${context})` : ''}: ${errorCode}`,
+        { errorCode, status },
+      );
+
+    case 'invalid_arguments':
+    case 'invalid_channel':
+    case 'invalid_name':
+    case 'invalid_timestamp':
+      return new ValidationError(
+        `Validation error${context ? ` (${context})` : ''}: ${errorCode}`,
+        { errorCode, status },
+      );
+
+    case 'ratelimited':
+      return new RateLimitError(`Rate limit exceeded${context ? ` (${context})` : ''}.`, 60, {
+        errorCode,
+        status,
+      });
+
+    default:
+      return new SlackError(
+        `Slack API error${context ? ` (${context})` : ''}: ${errorMessage || 'Unknown error'}`,
+        errorCode || 'UNKNOWN_ERROR',
+        status,
+        { errorCode, status },
+      );
+  }
 }
 
 /**
@@ -183,43 +229,4 @@ export function formatErrorForMCP(error: SlackError): {
     ],
     isError: true,
   };
-}
-
-/**
- * Wrap async function with error handling
- */
-export function withErrorHandling<T extends (...args: unknown[]) => Promise<unknown>>(
-  fn: T,
-  context?: string
-): T {
-  return (async (...args: unknown[]) => {
-    try {
-      return await fn(...args);
-    } catch (error) {
-      throw handleSlackError(error, context);
-    }
-  }) as T;
-}
-
-/**
- * Check if error is a specific type
- */
-export function isAuthError(error: unknown): error is AuthenticationError {
-  return error instanceof AuthenticationError;
-}
-
-export function isRateLimitError(error: unknown): error is RateLimitError {
-  return error instanceof RateLimitError;
-}
-
-export function isNotFoundError(error: unknown): error is NotFoundError {
-  return error instanceof NotFoundError;
-}
-
-export function isValidationError(error: unknown): error is ValidationError {
-  return error instanceof ValidationError;
-}
-
-export function isPermissionError(error: unknown): error is PermissionError {
-  return error instanceof PermissionError;
 }

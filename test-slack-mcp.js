@@ -1,573 +1,470 @@
 #!/usr/bin/env node
 
 /**
- * Comprehensive Test Suite for Slack MCP Server
+ * Guarded live smoke test for the public Slack MCP tool boundary.
  *
- * Tests all 13 tools and authentication functionality
- *
- * Usage:
- *   SLACK_COOKIE_D='your-cookie' SLACK_WORKSPACE_URL='https://workspace.slack.com' node test-slack-mcp.js
+ * Required:
+ *   SLACK_LIVE_SELF_NAME='Exact Slack display or real name'
  *
  * Optional:
- *   TEST_CHANNEL='C1234567890' - Channel ID to use for tests (defaults to 'general')
- *   SLACK_USER_AGENT='Custom-Agent' - Custom user agent
+ *   SLACK_LIVE_ALLOW_WRITES=1   Enable self-DM writes and cleanup.
+ *   SLACK_LIVE_FILE=F012ABCDEF  Check metadata and an eligible temp download.
+ *   SLACK_LIVE_TEST_SCHEDULE=1  Schedule and immediately cancel a self-DM.
  */
 
-import { SlackClient } from './build/slack-client.js';
+import assert from 'node:assert/strict';
+import { createHash, randomUUID } from 'node:crypto';
+import { createReadStream } from 'node:fs';
+import { promises as fs } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-// Configuration
-const config = {
-  cookieD: process.env.SLACK_COOKIE_D,
-  workspaceUrl: process.env.SLACK_WORKSPACE_URL,
-  userAgent: process.env.SLACK_USER_AGENT,
-  testChannel: process.env.TEST_CHANNEL || 'C1148LEDS', // Update with your test channel ID
-  logLevel: 'info',
-};
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 
-// Validate required config
-if (!config.cookieD || !config.workspaceUrl) {
-  console.error('❌ Missing required environment variables:');
-  console.error('   SLACK_COOKIE_D - Your Slack d cookie (URL-encoded)');
-  console.error('   SLACK_WORKSPACE_URL - Your workspace URL');
-  console.error('\nUsage:');
-  console.error('   SLACK_COOKIE_D="xoxd-..." SLACK_WORKSPACE_URL="https://workspace.slack.com" node test-slack-mcp.js');
-  process.exit(1);
-}
+const projectRoot = path.dirname(fileURLToPath(import.meta.url));
+const windowsLauncher = path.join(projectRoot, 'scripts', 'start-windows.mjs');
+const serverEntrypoint = path.join(projectRoot, 'build', 'index.js');
 
-// Test results tracking
-const results = {
-  passed: 0,
-  failed: 0,
-  tests: [],
-};
+const expectedTools = [
+  'send_message',
+  'send_direct_message',
+  'reply_to_thread',
+  'edit_message',
+  'delete_message',
+  'fetch_channel_messages',
+  'fetch_thread_messages',
+  'add_reaction',
+  'search_users',
+  'search_messages',
+  'get_file_info',
+  'download_file',
+];
 
-function logTest(name, passed, details = '') {
-  const status = passed ? '✅ PASS' : '❌ FAIL';
-  console.log(`${status}: ${name}`);
-  if (details) {
-    console.log(`   ${details}`);
-  }
-  
-  results.tests.push({ name, passed, details });
-  if (passed) {
-    results.passed++;
-  } else {
-    results.failed++;
+class ToolCallError extends Error {
+  constructor(tool, message) {
+    super(`${tool}: ${message}`);
+    this.name = 'ToolCallError';
+    this.tool = tool;
   }
 }
 
-function logSection(title) {
-  console.log('\n' + '='.repeat(60));
-  console.log(title);
-  console.log('='.repeat(60));
+function normalizeName(value) {
+  return String(value || '')
+    .normalize('NFKC')
+    .trim()
+    .replace(/\s+/g, ' ')
+    .toLocaleLowerCase('en-US');
 }
 
-async function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+function userNames(user) {
+  return [user.name, user.profile?.display_name, user.profile?.real_name].filter(Boolean);
 }
 
-async function runTests() {
-  let client;
-  let testMessageTs;
-  let scheduledMessageId;
-  let threadTs;
-  let reminderId;
-  
+function record(checks, status, name, details) {
+  checks.push({ status, name, details });
+  const label = status === 'pass' ? 'PASS' : status === 'skip' ? 'SKIP' : 'WARN';
+  console.log(`${label.padEnd(4)} ${name}${details ? ` - ${details}` : ''}`);
+}
+
+function textFromResult(result) {
+  return (result.content || [])
+    .filter((item) => item.type === 'text')
+    .map((item) => item.text)
+    .join('\n');
+}
+
+function parseToolResult(tool, result) {
+  const text = textFromResult(result);
+  if (result.isError) {
+    throw new ToolCallError(tool, text || 'unknown MCP tool error');
+  }
+
   try {
-    logSection('🚀 Starting Slack MCP Server Tests');
-    console.log('Configuration:');
-    console.log(`   Workspace URL: ${config.workspaceUrl}`);
-    console.log(`   User Agent: ${config.userAgent || 'default'}`);
-    console.log(`   Test Channel: ${config.testChannel}`);
-    console.log('');
-    
-    // Test 1: Client Initialization
-    logSection('Test 1: Client Initialization');
-    try {
-      client = new SlackClient(config);
-      logTest('Client initialization', true, 'SlackClient created successfully');
-    } catch (error) {
-      logTest('Client initialization', false, error.message);
-      throw error;
-    }
-    
-    // Test 2: Authentication
-    logSection('Test 2: Authentication');
-    try {
-      await client.authenticate();
-      logTest('Authentication', true, 'Successfully authenticated with Slack');
-    } catch (error) {
-      logTest('Authentication', false, error.message);
-      throw error;
-    }
-    
-    // Wait a bit between tests to avoid rate limiting
-    await sleep(1000);
-    
-    // Test 3: Send Message
-    logSection('Test 3: Send Message');
-    try {
-      const result = await client.sendMessage({
-        channel: config.testChannel,
-        text: '🧪 Test message from Slack MCP Server test suite',
-      });
-      testMessageTs = result.ts;
-      logTest(
-        'Send message',
-        result.ok !== false && result.ts,
-        `Message sent with timestamp: ${result.ts}`
-      );
-    } catch (error) {
-      logTest('Send message', false, error.message);
-    }
-    
-    await sleep(1000);
-    
-    // Test 4: Reply to Thread
-    logSection('Test 4: Reply to Thread');
-    if (testMessageTs) {
-      try {
-        const result = await client.sendMessage({
-          channel: config.testChannel,
-          text: '🧵 This is a thread reply',
-          thread_ts: testMessageTs,
-        });
-        threadTs = result.ts;
-        logTest(
-          'Reply to thread',
-          result.ok !== false && result.ts,
-          `Thread reply sent with timestamp: ${result.ts}`
-        );
-      } catch (error) {
-        logTest('Reply to thread', false, error.message);
-      }
-    } else {
-      logTest('Reply to thread', false, 'No message timestamp available');
-    }
-    
-    await sleep(1000);
-    
-    // Test 5: Add Reaction
-    logSection('Test 5: Add Reaction');
-    if (testMessageTs) {
-      try {
-        await client.addReaction({
-          channel: config.testChannel,
-          timestamp: testMessageTs,
-          name: 'white_check_mark',
-        });
-        logTest('Add reaction', true, 'Reaction ✅ added to test message');
-      } catch (error) {
-        logTest('Add reaction', false, error.message);
-      }
-    } else {
-      logTest('Add reaction', false, 'No message timestamp available');
-    }
-    
-    await sleep(1000);
-    
-    // Test 6: Fetch Channel Messages
-    logSection('Test 6: Fetch Channel Messages');
-    try {
-      const messages = await client.fetchMessages({
-        channel: config.testChannel,
-        limit: 10,
-      });
-      logTest(
-        'Fetch channel messages',
-        Array.isArray(messages) && messages.length > 0,
-        `Fetched ${messages.length} messages`
-      );
-    } catch (error) {
-      logTest('Fetch channel messages', false, error.message);
-    }
-    
-    await sleep(1000);
-    
-    // Test 7: Fetch Thread Messages
-    logSection('Test 7: Fetch Thread Messages');
-    if (testMessageTs) {
-      try {
-        const messages = await client.fetchThreadReplies({
-          channel: config.testChannel,
-          thread_ts: testMessageTs,
-        });
-        logTest(
-          'Fetch thread messages',
-          Array.isArray(messages) && messages.length > 0,
-          `Fetched ${messages.length} thread messages`
-        );
-      } catch (error) {
-        logTest('Fetch thread messages', false, error.message);
-      }
-    } else {
-      logTest('Fetch thread messages', false, 'No message timestamp available');
-    }
-    
-    await sleep(1000);
-    
-    // Test 8: Schedule Message
-    logSection('Test 8: Schedule Message');
-    try {
-      // Schedule message for 2 minutes from now
-      const postAt = Math.floor(Date.now() / 1000) + 120;
-      const result = await client.scheduleMessage({
-        channel: config.testChannel,
-        text: '⏰ This is a scheduled test message',
-        post_at: postAt,
-      });
-      scheduledMessageId = result.scheduled_message_id;
-      const scheduledTime = new Date(postAt * 1000).toLocaleString();
-      logTest(
-        'Schedule message',
-        result.ok !== false && result.scheduled_message_id,
-        `Message scheduled for ${scheduledTime} (ID: ${result.scheduled_message_id})`
-      );
-    } catch (error) {
-      // Note: Scheduled messages may not work with cookie auth (requires bot token)
-      if (error.message.includes('not_allowed_token_type')) {
-        logTest('Schedule message', true, 'Skipped - Cookie auth does not support scheduled messages (requires bot token)');
-      } else {
-        logTest('Schedule message', false, error.message);
-      }
-    }
-    
-    await sleep(1000);
-    
-    // Test 9: Send Direct Message (if user ID is available)
-    logSection('Test 9: Send Direct Message');
-    try {
-      // Try to send DM to self (using authenticated user ID)
-      const dmChannel = await client.openDirectMessage('U113X7CUT'); // Update with your user ID
-      const result = await client.sendMessage({
-        channel: dmChannel,
-        text: '👋 Test DM from Slack MCP Server test suite',
-      });
-      logTest(
-        'Send direct message',
-        result.ok !== false && result.ts,
-        `DM sent to channel ${dmChannel}`
-      );
-    } catch (error) {
-      logTest('Send direct message', false, error.message);
-    }
-    
-    await sleep(1000);
-    
-    // Test 10: Edit Message
-    logSection('Test 10: Edit Message');
-    if (testMessageTs) {
-      try {
-        const result = await client.updateMessage({
-          channel: config.testChannel,
-          ts: testMessageTs,
-          text: '✏️ Test message (EDITED)',
-        });
-        logTest(
-          'Edit message',
-          result.ok !== false && result.ts,
-          `Message edited successfully: ${result.ts}`
-        );
-      } catch (error) {
-        logTest('Edit message', false, error.message);
-      }
-    } else {
-      logTest('Edit message', false, 'No message timestamp available');
-    }
-    
-    await sleep(1000);
-    
-    // Test 11: List Reminders
-    logSection('Test 11: List Reminders');
-    try {
-      const reminders = await client.listReminders();
-      logTest(
-        'List reminders',
-        Array.isArray(reminders),
-        `Found ${reminders.length} reminder(s)`
-      );
-    } catch (error) {
-      logTest('List reminders', false, error.message);
-    }
-    
-    await sleep(1000);
-    
-    // Test 12: Create Reminder
-    logSection('Test 12: Create Reminder');
-    try {
-      // Create reminder for 5 minutes from now
-      const reminderTime = Math.floor(Date.now() / 1000) + 300;
-      const result = await client.createReminder({
-        text: 'Test reminder from Slack MCP test suite',
-        time: reminderTime,
-      });
-      reminderId = result.id;
-      const scheduledTime = new Date(reminderTime * 1000).toLocaleString();
-      logTest(
-        'Create reminder',
-        result.id,
-        `Reminder created for ${scheduledTime} (ID: ${result.id})`
-      );
-    } catch (error) {
-      logTest('Create reminder', false, error.message);
-    }
-    
-    await sleep(1000);
-    
-    // Test 13: Delete Reminder
-    logSection('Test 13: Delete Reminder');
-    if (reminderId) {
-      try {
-        await client.deleteReminder(reminderId);
-        logTest('Delete reminder', true, `Reminder ${reminderId} deleted successfully`);
-      } catch (error) {
-        logTest('Delete reminder', false, error.message);
-      }
-    } else {
-      logTest('Delete reminder', false, 'No reminder ID available');
-    }
-    
-    await sleep(1000);
-    
-    // Test 14: Delete Message
-    logSection('Test 14: Delete Message');
-    if (testMessageTs) {
-      try {
-        await client.deleteMessage({
-          channel: config.testChannel,
-          ts: testMessageTs,
-        });
-        logTest('Delete message', true, `Message ${testMessageTs} deleted successfully`);
-      } catch (error) {
-        logTest('Delete message', false, error.message);
-      }
-    } else {
-      logTest('Delete message', false, 'No message timestamp available');
-    }
-    
-    await sleep(1000);
-    
-    // Test 15: Search Users
-    logSection('Test 15: Search Users');
-    try {
-      const userList = client.getOrLoadUserListCache();
-
-      // Test exact match
-      if (userList && userList.users.length > 0) {
-        const testUser = userList.users[0];
-        const searchQuery = testUser.name;
-        
-        // Simulate search by filtering the user list
-        const matches = userList.users.filter(u => {
-          const name = u.name.toLowerCase();
-          const displayName = u.display_name.toLowerCase();
-          const realName = u.real_name.toLowerCase();
-          const query = searchQuery.toLowerCase();
-          
-          return name.includes(query) ||
-                 displayName.includes(query) ||
-                 realName.includes(query);
-        });
-        
-        logTest(
-          'Search users - exact match',
-          matches.length > 0 && matches.some(m => m.id === testUser.id),
-          `Found ${matches.length} match(es) for "${searchQuery}"`
-        );
-      } else {
-        logTest('Search users - exact match', false, 'No users in cache');
-      }
-      
-      // Test partial match
-      if (userList && userList.users.length > 0) {
-        const testUser = userList.users[0];
-        const partialQuery = testUser.name.substring(0, 3);
-        
-        const matches = userList.users.filter(u => {
-          const name = u.name.toLowerCase();
-          const displayName = u.display_name.toLowerCase();
-          const realName = u.real_name.toLowerCase();
-          const query = partialQuery.toLowerCase();
-          
-          return name.includes(query) ||
-                 displayName.includes(query) ||
-                 realName.includes(query);
-        });
-        
-        logTest(
-          'Search users - partial match',
-          matches.length > 0,
-          `Found ${matches.length} match(es) for partial query "${partialQuery}"`
-        );
-      }
-      
-      // Test no match
-      if (userList) {
-        const noMatchQuery = 'xyzabc123nonexistent';
-        const noMatches = userList.users.filter(u => {
-          const name = u.name.toLowerCase();
-          const displayName = u.display_name.toLowerCase();
-          const realName = u.real_name.toLowerCase();
-          const query = noMatchQuery.toLowerCase();
-
-          return name.includes(query) ||
-                 displayName.includes(query) ||
-                 realName.includes(query);
-        });
-
-        logTest(
-          'Search users - no match',
-          noMatches.length === 0,
-          `Correctly returned 0 matches for "${noMatchQuery}"`
-        );
-
-        // Test user cache exists
-        logTest(
-          'User list cache',
-          userList.users.length > 0,
-          `User cache contains ${userList.users.length} user(s)`
-        );
-      } else {
-        logTest('Search users', false, 'No user cache available');
-      }
-      
-    } catch (error) {
-      logTest('Search users', false, error.message);
-    }
-    
-    await sleep(1000);
-    
-    // Test 16: Custom User Agent
-    logSection('Test 16: Custom User Agent');
-    try {
-      const customClient = new SlackClient({
-        ...config,
-        userAgent: 'Test-Agent/1.0',
-      });
-      await customClient.authenticate();
-      logTest('Custom User-Agent', true, 'Custom user agent works correctly');
-    } catch (error) {
-      logTest('Custom User-Agent', false, error.message);
-    }
-    
-    await sleep(1000);
-    
-    // Test 17: Lookup User by Name
-    logSection('Test 17: Lookup User by Name');
-    try {
-      const userList = client.getOrLoadUserListCache();
-      if (userList && userList.users.length > 0) {
-        const testUser = userList.users[0];
-        const foundUserId = await client.lookupUserByName(testUser.name);
-        
-        logTest(
-          'Lookup user by username',
-          foundUserId === testUser.id,
-          `Found user ID ${foundUserId} for username "${testUser.name}"`
-        );
-        
-        // Test with display name
-        if (testUser.display_name) {
-          const foundByDisplay = await client.lookupUserByName(testUser.display_name);
-          logTest(
-            'Lookup user by display name',
-            foundByDisplay === testUser.id,
-            `Found user ID ${foundByDisplay} for display name "${testUser.display_name}"`
-          );
-        }
-        
-        // Test non-existent user
-        const notFoundId = await client.lookupUserByName('nonexistentuserxyz123');
-        logTest(
-          'Lookup non-existent user',
-          notFoundId === null,
-          'Correctly returned null for non-existent user'
-        );
-      } else {
-        logTest('Lookup user by name', false, 'No users in cache');
-      }
-    } catch (error) {
-      logTest('Lookup user by name', false, error.message);
-    }
-    
-    await sleep(1000);
-    
-    // Test 18: Search Messages
-    logSection('Test 18: Search Messages');
-    try {
-      // Test basic keyword search
-      const searchResults = await client.searchMessages({
-        query: 'test',
-        count: 10,
-        sort: 'timestamp',
-        sort_dir: 'desc',
-      });
-      
-      logTest(
-        'Search messages - basic query',
-        searchResults.ok && searchResults.messages.matches.length >= 0,
-        `Found ${searchResults.messages.matches.length} matches for "test" (${searchResults.messages.total} total)`
-      );
-      
-      // Test channel filter search
-      const channelSearchResults = await client.searchMessages({
-        query: `in:#${config.testChannel}`,
-        count: 5,
-      });
-      
-      logTest(
-        'Search messages - channel filter',
-        channelSearchResults.ok && channelSearchResults.messages.matches.length >= 0,
-        `Found ${channelSearchResults.messages.matches.length} matches in test channel`
-      );
-      
-      // Test pagination
-      const page1 = await client.searchMessages({
-        query: 'test',
-        count: 2,
-        page: 1,
-      });
-      
-      logTest(
-        'Search messages - pagination',
-        page1.ok && page1.messages.pagination.page === 1,
-        `Page 1 results: ${page1.messages.matches.length} messages`
-      );
-      
-    } catch (error) {
-      logTest('Search messages', false, error.message);
-    }
-    
-    // Final summary
-    logSection('📊 Test Results Summary');
-    console.log(`Total Tests: ${results.tests.length}`);
-    console.log(`✅ Passed: ${results.passed}`);
-    console.log(`❌ Failed: ${results.failed}`);
-    console.log(`Success Rate: ${((results.passed / results.tests.length) * 100).toFixed(1)}%`);
-    
-    if (results.failed > 0) {
-      console.log('\n❌ Failed Tests:');
-      results.tests
-        .filter(t => !t.passed)
-        .forEach(t => console.log(`   - ${t.name}: ${t.details}`));
-    }
-    
-    console.log('\n' + '='.repeat(60));
-    
-    if (scheduledMessageId) {
-      console.log('\n⚠️  Note: Messages may have been scheduled or sent during testing.');
-      console.log('   Check your test channel and scheduled messages if needed.');
-    }
-    
-    // Exit with appropriate code
-    process.exit(results.failed > 0 ? 1 : 0);
-    
-  } catch (error) {
-    console.error('\n❌ Fatal Error:', error.message);
-    console.error(error.stack);
-    process.exit(1);
+    return JSON.parse(text);
+  } catch {
+    return text;
   }
 }
 
-// Run the tests
-runTests();
+function isObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isPathInside(parent, candidate) {
+  const relative = path.relative(path.resolve(parent), path.resolve(candidate));
+  return relative !== '' && !relative.startsWith('..') && !path.isAbsolute(relative);
+}
+
+async function sha256File(filePath) {
+  const hash = createHash('sha256');
+  for await (const chunk of createReadStream(filePath)) {
+    hash.update(chunk);
+  }
+  return hash.digest('hex');
+}
+
+async function delay(milliseconds) {
+  await new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function loadAuthenticatedSelf(targetName) {
+  const [{ loadSlackRuntimeConfig }, { SlackClient }] = await Promise.all([
+    import('./build/config.js'),
+    import('./build/slack-client.js'),
+  ]);
+  const config = await loadSlackRuntimeConfig({ useWindowsUserEnvironment: true });
+  const slack = new SlackClient({
+    cookieD: config.cookieD,
+    workspaceUrl: config.workspaceUrl,
+    userAgent: config.userAgent,
+    logLevel: 'error',
+    userCacheFile: config.userCacheFile,
+  });
+
+  await slack.authenticate();
+  const id = slack.getAuthenticatedUserId();
+  const user = await slack.getUserInfo(id);
+  const expected = normalizeName(targetName);
+  assert.ok(
+    userNames(user).some((name) => normalizeName(name) === expected),
+    `Authenticated Slack user does not exactly match SLACK_LIVE_SELF_NAME=${JSON.stringify(targetName)}`,
+  );
+
+  return { slack, id, user };
+}
+
+async function main() {
+  const targetName = (process.env.SLACK_LIVE_SELF_NAME || '').trim();
+  const allowWrites = process.env.SLACK_LIVE_ALLOW_WRITES === '1';
+  const fileReference = (process.env.SLACK_LIVE_FILE || '').trim();
+  const testSchedule = process.env.SLACK_LIVE_TEST_SCHEDULE === '1';
+
+  if (!targetName) {
+    throw new Error(
+      'SLACK_LIVE_SELF_NAME is required. No Slack request was made. Set it to the exact authenticated user name.',
+    );
+  }
+  if (testSchedule && !allowWrites) {
+    throw new Error('SLACK_LIVE_TEST_SCHEDULE=1 requires SLACK_LIVE_ALLOW_WRITES=1');
+  }
+
+  const enabledTools = testSchedule ? [...expectedTools, 'schedule_message'] : expectedTools;
+
+  const checks = [];
+  const trackedMessages = [];
+  const trackedDownloads = [];
+  const trackedSchedules = [];
+  const cleanupErrors = [];
+  let transport;
+  let mcp;
+  let identity;
+  let primaryError;
+
+  const callTool = async (name, args = {}) => {
+    const result = await mcp.callTool({ name, arguments: args });
+    return parseToolResult(name, result);
+  };
+
+  const forget = (collection, item) => {
+    const index = collection.indexOf(item);
+    if (index >= 0) collection.splice(index, 1);
+  };
+
+  try {
+    const inheritedEnvironment = Object.fromEntries(
+      Object.entries(process.env).filter(([, value]) => value !== undefined),
+    );
+    transport = new StdioClientTransport({
+      command: process.execPath,
+      args: [process.platform === 'win32' ? windowsLauncher : serverEntrypoint],
+      cwd: projectRoot,
+      env: {
+        ...inheritedEnvironment,
+        LOG_LEVEL: 'error',
+        SLACK_RESPONSE_FORMAT: 'json',
+        SLACK_ENABLE_SCHEDULE_MESSAGE: testSchedule ? '1' : '0',
+      },
+      stderr: 'pipe',
+    });
+    // Drain stderr so a noisy failure cannot block the stdio child. It is not
+    // echoed because integration errors may contain workspace-specific data.
+    transport.stderr?.resume();
+
+    mcp = new Client({ name: 'slack-local-live-self-smoke', version: '1.0.0' });
+    await mcp.connect(transport);
+
+    const listed = await mcp.listTools();
+    const actualToolNames = listed.tools.map((tool) => tool.name).sort();
+    assert.deepEqual(actualToolNames, [...enabledTools].sort());
+    record(checks, 'pass', 'MCP handshake and registry', `${actualToolNames.length} tools`);
+
+    const users = await callTool('search_users', {
+      query: targetName,
+      limit: 5,
+    });
+    assert.ok(isObject(users) && Array.isArray(users.results), 'search_users returned no results');
+    record(
+      checks,
+      'pass',
+      'search_users',
+      `${users.match_count} result(s) via ${users.source || 'unknown source'}; exhaustive=${users.exhaustive}`,
+    );
+
+    if (allowWrites) {
+      identity = await loadAuthenticatedSelf(targetName);
+      record(checks, 'pass', 'authenticated self identity', `${targetName} (${identity.id})`);
+    }
+
+    if (fileReference) {
+      const metadata = await callTool('get_file_info', { file: fileReference });
+      assert.ok(isObject(metadata) && isObject(metadata.file), 'get_file_info returned no file');
+      assert.doesNotMatch(JSON.stringify(metadata), /url_private|xox[acdpors]-/i);
+      record(
+        checks,
+        'pass',
+        'get_file_info',
+        `${metadata.file.id} ${metadata.file.mimetype} ${metadata.file.size} bytes`,
+      );
+
+      const download = await callTool('download_file', { file: fileReference });
+      if (download.downloaded) {
+        assert.equal(typeof download.path, 'string');
+        assert.ok(isPathInside(path.join(os.tmpdir(), 'slack-local-mcp'), download.path));
+        const stats = await fs.stat(download.path);
+        assert.equal(stats.size, download.bytes);
+        assert.equal(await sha256File(download.path), download.sha256);
+        trackedDownloads.push(download.path);
+        record(checks, 'pass', 'download_file', `${download.bytes} bytes verified in TEMP`);
+      } else {
+        record(checks, 'skip', 'download_file', download.reason || 'file policy skipped it');
+      }
+    } else {
+      record(checks, 'skip', 'file tools', 'SLACK_LIVE_FILE was not set');
+    }
+
+    if (!allowWrites) {
+      record(
+        checks,
+        'skip',
+        'Slack write tools',
+        'set SLACK_LIVE_ALLOW_WRITES=1 after reviewing the target identity',
+      );
+    } else {
+      const marker = `SLACKMCP${Date.now()}${randomUUID().replaceAll('-', '').slice(0, 8)}`;
+      const root = await callTool('send_direct_message', {
+        user: identity.id,
+        text: `${marker} temporary self-DM smoke root; this message will be deleted.`,
+      });
+      assert.ok(root.success && root.channel && root.ts);
+      const rootRecord = { channel: root.channel, timestamp: root.ts, label: 'self-DM root' };
+      trackedMessages.push(rootRecord);
+      record(checks, 'pass', 'send_direct_message', `self-DM ${root.channel}`);
+
+      const second = await callTool('send_message', {
+        channel: root.channel,
+        text: `${marker} temporary send_message smoke; this message will be deleted.`,
+        unfurl_links: false,
+      });
+      assert.ok(second.success && second.channel === root.channel && second.ts);
+      const secondRecord = {
+        channel: second.channel,
+        timestamp: second.ts,
+        label: 'send_message root',
+      };
+      trackedMessages.push(secondRecord);
+      record(checks, 'pass', 'send_message', 'same authenticated self-DM');
+
+      const edited = await callTool('edit_message', {
+        channel: root.channel,
+        timestamp: root.ts,
+        text: `${marker} temporary self-DM smoke root EDITED; this message will be deleted.`,
+      });
+      assert.ok(edited.success && edited.ts === root.ts);
+      record(checks, 'pass', 'edit_message');
+
+      const reaction = await callTool('add_reaction', {
+        channel: root.channel,
+        timestamp: root.ts,
+        reaction: 'white_check_mark',
+      });
+      assert.equal(reaction.success, true);
+      record(checks, 'pass', 'add_reaction');
+
+      const reply = await callTool('reply_to_thread', {
+        channel: root.channel,
+        thread_ts: root.ts,
+        text: `${marker} temporary thread reply; this message will be deleted.`,
+        broadcast: false,
+      });
+      assert.ok(reply.success && reply.channel === root.channel && reply.ts);
+      const replyRecord = {
+        channel: reply.channel,
+        timestamp: reply.ts,
+        label: 'thread reply',
+      };
+      trackedMessages.push(replyRecord);
+      record(checks, 'pass', 'reply_to_thread', 'non-broadcast self-DM reply');
+
+      const thread = await callTool('fetch_thread_messages', {
+        channel: root.channel,
+        thread_ts: root.ts,
+        limit: 20,
+      });
+      assert.ok(isObject(thread) && Array.isArray(thread.messages));
+      assert.ok(thread.messages.some((message) => message.ts === root.ts));
+      assert.ok(thread.messages.some((message) => message.ts === reply.ts));
+      record(checks, 'pass', 'fetch_thread_messages', `${thread.message_count} messages`);
+
+      const channelMessages = await callTool('fetch_channel_messages', {
+        channel: root.channel,
+        limit: 20,
+      });
+      assert.ok(isObject(channelMessages) && Array.isArray(channelMessages.messages));
+      assert.ok(channelMessages.messages.some((message) => message.ts === root.ts));
+      assert.ok(channelMessages.messages.some((message) => message.ts === second.ts));
+      record(checks, 'pass', 'fetch_channel_messages', `${channelMessages.message_count} messages`);
+
+      let indexed = false;
+      for (let attempt = 0; attempt < 5 && !indexed; attempt += 1) {
+        const search = await callTool('search_messages', {
+          query: marker,
+          count: 20,
+          page: 1,
+          sort: 'timestamp',
+          sort_dir: 'desc',
+          highlight: false,
+        });
+        indexed =
+          isObject(search) &&
+          Array.isArray(search.messages) &&
+          search.messages.some((message) => message.text.includes(marker));
+        if (!indexed && attempt < 4) await delay(2_000);
+      }
+      record(
+        checks,
+        indexed ? 'pass' : 'warn',
+        'search_messages',
+        indexed
+          ? 'new self-DM message indexed'
+          : 'API succeeded; new message not indexed within 8s',
+      );
+
+      if (testSchedule) {
+        try {
+          const scheduled = await callTool('schedule_message', {
+            channel: root.channel,
+            text: `${marker} temporary scheduled self-DM; this schedule will be cancelled.`,
+            post_at: Math.floor(Date.now() / 1000) + 300,
+          });
+          assert.ok(scheduled.success && scheduled.scheduled_message_id);
+          const scheduleRecord = {
+            channel: scheduled.channel,
+            id: scheduled.scheduled_message_id,
+          };
+          trackedSchedules.push(scheduleRecord);
+          record(checks, 'pass', 'schedule_message', 'self-DM scheduled');
+          await identity.slack.deleteScheduledMessage({
+            channel: scheduleRecord.channel,
+            scheduled_message_id: scheduleRecord.id,
+          });
+          forget(trackedSchedules, scheduleRecord);
+          record(checks, 'pass', 'scheduled-message cleanup', 'cancelled immediately');
+        } catch (error) {
+          if (error instanceof ToolCallError && /not_allowed_token_type/i.test(error.message)) {
+            record(checks, 'skip', 'schedule_message', 'Slack cookie token type does not allow it');
+          } else {
+            throw error;
+          }
+        }
+      } else {
+        record(checks, 'skip', 'schedule_message', 'SLACK_LIVE_TEST_SCHEDULE was not set');
+      }
+
+      const deleted = await callTool('delete_message', {
+        channel: secondRecord.channel,
+        timestamp: secondRecord.timestamp,
+      });
+      assert.equal(deleted.success, true);
+      forget(trackedMessages, secondRecord);
+      record(checks, 'pass', 'delete_message');
+    }
+  } catch (error) {
+    primaryError = error;
+  } finally {
+    if (identity) {
+      for (const schedule of [...trackedSchedules].reverse()) {
+        try {
+          await identity.slack.deleteScheduledMessage({
+            channel: schedule.channel,
+            scheduled_message_id: schedule.id,
+          });
+          forget(trackedSchedules, schedule);
+          record(checks, 'pass', 'cleanup scheduled message', schedule.id);
+        } catch (error) {
+          cleanupErrors.push(new Error(`Scheduled message ${schedule.id}: ${error.message}`));
+        }
+      }
+    }
+
+    if (mcp) {
+      for (const message of [...trackedMessages].reverse()) {
+        try {
+          await callTool('delete_message', {
+            channel: message.channel,
+            timestamp: message.timestamp,
+          });
+          forget(trackedMessages, message);
+          record(checks, 'pass', `cleanup ${message.label}`, message.timestamp);
+        } catch (error) {
+          cleanupErrors.push(new Error(`${message.label} ${message.timestamp}: ${error.message}`));
+        }
+      }
+    }
+
+    for (const filePath of [...trackedDownloads].reverse()) {
+      try {
+        await fs.unlink(filePath);
+        forget(trackedDownloads, filePath);
+        record(checks, 'pass', 'cleanup TEMP download', path.basename(filePath));
+      } catch (error) {
+        cleanupErrors.push(new Error(`TEMP file ${filePath}: ${error.message}`));
+      }
+    }
+
+    if (transport) {
+      try {
+        await transport.close();
+      } catch (error) {
+        cleanupErrors.push(new Error(`MCP transport: ${error.message}`));
+      }
+    }
+  }
+
+  if (cleanupErrors.length > 0) {
+    const details = cleanupErrors.map((error) => error.message).join('; ');
+    if (primaryError) {
+      throw new AggregateError(
+        [primaryError, ...cleanupErrors],
+        `Live smoke and cleanup failed: ${details}`,
+      );
+    }
+    throw new AggregateError(cleanupErrors, `Live smoke cleanup failed: ${details}`);
+  }
+  if (primaryError) throw primaryError;
+
+  const passed = checks.filter((check) => check.status === 'pass').length;
+  const warnings = checks.filter((check) => check.status === 'warn').length;
+  const skipped = checks.filter((check) => check.status === 'skip').length;
+  console.log(`DONE ${passed} passed, ${warnings} warnings, ${skipped} skipped; cleanup complete`);
+}
+
+main().catch((error) => {
+  const messages =
+    error instanceof AggregateError
+      ? error.errors.map((item) => (item instanceof Error ? item.message : String(item)))
+      : [error instanceof Error ? error.message : String(error)];
+  console.error(`FAIL ${messages.join(' | ')}`);
+  process.exitCode = 1;
+});

@@ -4,50 +4,102 @@
  */
 
 import { encode } from '@toon-format/toon';
+
+import type {
+  FetchMessagesOutput,
+  FormattedSlackFile,
+  SearchMessagesOutput,
+  SlackReaction,
+} from '../types.js';
+
 import { logger } from './logger.js';
+
+interface McpErrorResponse {
+  content: Array<{ type: string; text: string }>;
+  isError: boolean;
+}
+
+function isMcpErrorResponse(value: unknown): value is McpErrorResponse {
+  return (
+    typeof value === 'object' && value !== null && 'isError' in value && value.isError === true
+  );
+}
+
+function stringifyJson(value: unknown): string {
+  return JSON.stringify(value, null, 2) ?? 'null';
+}
+
+function formatFiles(files: FormattedSlackFile[] | undefined): string {
+  return (
+    files
+      ?.map((file) =>
+        [
+          file.id,
+          file.name,
+          file.mimetype,
+          file.size ?? '',
+          file.category,
+          file.download_eligible_by_default ? 'default-download' : 'metadata-only',
+        ].join(':'),
+      )
+      .join('|') || ''
+  );
+}
+
+function formatReactions(
+  reactions: SlackReaction[] | undefined,
+  userCache: Map<string, string>,
+): string {
+  return (
+    reactions
+      ?.map((reaction) => {
+        const userNames = reaction.users.map((id) => userCache.get(id) || id).join(';');
+        return `${reaction.name}×${reaction.count}(${userNames})`;
+      })
+      .join('|') || ''
+  );
+}
+
+function encodeSafely<T>(
+  data: T,
+  fallbackContext: string,
+  transform: (value: T) => unknown = (value) => value,
+): string {
+  try {
+    return encode(transform(data));
+  } catch (error) {
+    logger.debug(`TOON encoding failed for ${fallbackContext}, using JSON`, error);
+    return stringifyJson(data);
+  }
+}
 
 /**
  * Format fetch messages response (fetch_channel_messages, fetch_thread_messages)
  * Flattens reactions for TOON tabular format
  */
 export function formatFetchMessagesResponse(
-  data: any,
+  data: FetchMessagesOutput | string | McpErrorResponse,
   format: 'toon' | 'json',
-  userCache: Map<string, string>
+  userCache: Map<string, string>,
 ): string {
-  // Pass through if already formatted (string or error)
-  if (typeof data === 'string' || 'isError' in data) {
-    return JSON.stringify(data, null, 2);
+  if (format === 'json' || typeof data === 'string' || isMcpErrorResponse(data)) {
+    return stringifyJson(data);
   }
 
-  if (format === 'json') {
-    return JSON.stringify(data, null, 2);
-  }
-
-  try {
-    // Normalize to uniform structure for TOON tabular format
-    const normalized = {
-      ...data,
-      messages: data.messages.map((msg: any) => ({
-        user: msg.user,
-        text: msg.text,
-        ts: msg.ts,
-        timestamp: msg.timestamp,
-        thread_ts: msg.thread_ts || '', // Normalize null → empty string
-        reply_count: msg.reply_count || 0, // Normalize null → 0
-        is_bot: msg.is_bot || false,
-        reactions: msg.reactions?.map((r: any) => {
-          const userNames = r.users.map((uid: string) => userCache.get(uid) || uid).join(';');
-          return `${r.name}×${r.count}(${userNames})`;
-        }).join('|') || '', // Normalize to pipe-separated string (avoids comma conflicts)
-      })),
-    };
-
-    return encode(normalized);
-  } catch (error) {
-    logger.debug('TOON encoding failed for fetch messages, using JSON', error);
-    return JSON.stringify(data, null, 2);
-  }
+  return encodeSafely(data, 'fetch messages', (value) => ({
+    ...value,
+    messages: value.messages.map((message) => ({
+      user: message.user,
+      text: message.text,
+      ts: message.ts,
+      timestamp: message.timestamp,
+      thread_ts: message.thread_ts || '',
+      reply_count: message.reply_count || 0,
+      is_bot: message.is_bot || false,
+      files: formatFiles(message.files),
+      reactions: formatReactions(message.reactions, userCache),
+    })),
+  }));
 }
 
 /**
@@ -55,91 +107,37 @@ export function formatFetchMessagesResponse(
  * Flattens reactions for TOON tabular format
  */
 export function formatSearchMessagesResponse(
-  data: any,
+  data: SearchMessagesOutput | string | McpErrorResponse,
   format: 'toon' | 'json',
-  userCache: Map<string, string>
+  userCache: Map<string, string>,
 ): string {
-  // Pass through if already formatted (string or error)
-  if (typeof data === 'string' || 'isError' in data) {
-    return JSON.stringify(data, null, 2);
+  if (format === 'json' || typeof data === 'string' || isMcpErrorResponse(data)) {
+    return stringifyJson(data);
   }
 
-  if (format === 'json') {
-    return JSON.stringify(data, null, 2);
-  }
-
-  try {
-    // Normalize to uniform structure for TOON tabular format
-    const normalized = {
-      ...data,
-      messages: data.messages.map((msg: any) => ({
-        user: msg.user,
-        text: msg.text,
-        ts: msg.ts,
-        timestamp: msg.timestamp,
-        channel: msg.channel,
-        permalink: msg.permalink,
-        thread_ts: msg.thread_ts || '', // Normalize null → empty string
-        reactions: msg.reactions?.map((r: any) => {
-          const userNames = r.users.map((uid: string) => userCache.get(uid) || uid).join(';');
-          return `${r.name}×${r.count}(${userNames})`;
-        }).join('|') || '', // Normalize to pipe-separated string (avoids comma conflicts)
-      })),
-    };
-
-    return encode(normalized);
-  } catch (error) {
-    logger.debug('TOON encoding failed for search messages, using JSON', error);
-    return JSON.stringify(data, null, 2);
-  }
+  return encodeSafely(data, 'search messages', (value) => ({
+    ...value,
+    messages: value.messages.map((message) => ({
+      user: message.user,
+      text: message.text,
+      ts: message.ts,
+      timestamp: message.timestamp,
+      channel: message.channel,
+      permalink: message.permalink,
+      thread_ts: message.thread_ts || '',
+      files: formatFiles(message.files),
+      reactions: formatReactions(message.reactions, userCache),
+    })),
+  }));
 }
 
 /**
  * Format search users response
  * No flattening needed - already optimal for TOON
  */
-export function formatSearchUsersResponse(
-  data: any,
-  format: 'toon' | 'json'
-): string {
-  // Pass through if already formatted (string or error)
-  if (typeof data === 'string' || 'isError' in data) {
-    return JSON.stringify(data, null, 2);
+export function formatSearchUsersResponse(data: unknown, format: 'toon' | 'json'): string {
+  if (format === 'json' || typeof data === 'string' || isMcpErrorResponse(data)) {
+    return stringifyJson(data);
   }
-
-  if (format === 'json') {
-    return JSON.stringify(data, null, 2);
-  }
-
-  try {
-    return encode(data);
-  } catch (error) {
-    logger.debug('TOON encoding failed for search users, using JSON', error);
-    return JSON.stringify(data, null, 2);
-  }
-}
-
-/**
- * Format list reminders response
- * No flattening needed - already optimal for TOON
- */
-export function formatListRemindersResponse(
-  data: any,
-  format: 'toon' | 'json'
-): string {
-  // Pass through if already formatted (string or error)
-  if (typeof data === 'string' || 'isError' in data) {
-    return JSON.stringify(data, null, 2);
-  }
-
-  if (format === 'json') {
-    return JSON.stringify(data, null, 2);
-  }
-
-  try {
-    return encode(data);
-  } catch (error) {
-    logger.debug('TOON encoding failed for list reminders, using JSON', error);
-    return JSON.stringify(data, null, 2);
-  }
+  return encodeSafely(data, 'search users');
 }

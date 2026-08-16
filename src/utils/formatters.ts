@@ -2,7 +2,9 @@
  * Formatting utilities for Slack messages and data
  */
 
-import { SlackMessage, FormattedMessage } from '../types.js';
+import type { SlackMessage, FormattedMessage } from '../types.js';
+
+import { formatSlackFile } from './file-download.js';
 
 /**
  * Format a Unix timestamp to human-readable date
@@ -10,7 +12,7 @@ import { SlackMessage, FormattedMessage } from '../types.js';
 export function formatTimestamp(ts: string): string {
   const timestamp = parseFloat(ts) * 1000; // Convert to milliseconds
   const date = new Date(timestamp);
-  
+
   return date.toLocaleString('en-US', {
     year: 'numeric',
     month: 'short',
@@ -54,8 +56,11 @@ export function parseSlackMarkdown(text: string): string {
 /**
  * Format a single Slack message for display
  */
-export function formatMessage(message: SlackMessage, userCache?: Map<string, string>): FormattedMessage {
-  const userName = message.user && userCache?.get(message.user) || message.user || 'Unknown';
+export function formatMessage(
+  message: SlackMessage,
+  userCache?: Map<string, string>,
+): FormattedMessage {
+  const userName = (message.user && userCache?.get(message.user)) || message.user || 'Unknown';
   const isBot = !!message.bot_id || !!message.app_id;
 
   return {
@@ -67,43 +72,8 @@ export function formatMessage(message: SlackMessage, userCache?: Map<string, str
     reply_count: message.reply_count,
     reactions: message.reactions,
     is_bot: isBot,
+    files: message.files?.map(formatSlackFile),
   };
-}
-
-/**
- * Format user mention for Slack API
- */
-export function formatUserMention(userId: string): string {
-  return `<@${userId}>`;
-}
-
-/**
- * Format channel mention for Slack API
- */
-export function formatChannelMention(channelId: string): string {
-  return `<#${channelId}>`;
-}
-
-/**
- * Create a summary header for fetched messages
- */
-export function createMessagesSummary(
-  messages: SlackMessage[],
-  channel: string
-): string {
-  const lines: string[] = [];
-  lines.push(`Channel: ${channel}`);
-  lines.push(`Message count: ${messages.length}`);
-  
-  if (messages.length > 0) {
-    const timestamps = messages.map((m) => parseFloat(m.ts));
-    const oldest = new Date(Math.min(...timestamps) * 1000);
-    const latest = new Date(Math.max(...timestamps) * 1000);
-    
-    lines.push(`Time range: ${oldest.toLocaleString()} to ${latest.toLocaleString()}`);
-  }
-  
-  return lines.join('\n');
 }
 
 /**
@@ -111,7 +81,7 @@ export function createMessagesSummary(
  */
 export function formatScheduledTime(postAt: number): string {
   const date = new Date(postAt * 1000);
-  
+
   return date.toLocaleString('en-US', {
     year: 'numeric',
     month: 'long',
@@ -121,14 +91,4 @@ export function formatScheduledTime(postAt: number): string {
     timeZoneName: 'short',
     hour12: true,
   });
-}
-
-/**
- * Truncate text to a maximum length with ellipsis
- */
-export function truncateText(text: string, maxLength: number): string {
-  if (text.length <= maxLength) {
-    return text;
-  }
-  return text.slice(0, maxLength - 3) + '...';
 }

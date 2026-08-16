@@ -2,10 +2,18 @@
  * Slack API Client with cookie-based authentication
  */
 
-import axios, { AxiosInstance, AxiosError } from 'axios';
 import * as fs from 'fs';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { createHash, randomUUID } from 'node:crypto';
+import { promises as fsPromises } from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'path';
-import {
+
+import axios from 'axios';
+import type { AxiosInstance, AxiosError } from 'axios';
+
+import type {
+  SlackApiResponse,
   SlackClientConfig,
   SlackAuthTestResponse,
   SlackMessageResponse,
@@ -15,18 +23,32 @@ import {
   SlackConversationsOpenResponse,
   SlackReactionsAddResponse,
   SlackUsersInfoResponse,
+  SlackUsersListResponse,
   SlackMessage,
   SlackUser,
-  AuthenticationError,
-  ValidationError,
-  SlackRemindersListResponse,
-  SlackReminderResponse,
-  SlackReminder,
   SlackSearchMessagesResponse,
+  SlackFile,
+  SlackFilesInfoResponse,
+  FileDownloadResult,
 } from './types.js';
-import { logger } from './utils/logger.js';
+import { AuthenticationError, CancelledError, ValidationError } from './types.js';
 import { handleSlackError } from './utils/errors.js';
-import { validateSlackCookie } from './utils/validation.js';
+import {
+  assertAllowedSlackDownloadUrl,
+  classifySlackFile,
+  cleanupSlackDownloadDirectory,
+  getFileCategorySkipReason,
+  MAX_FILE_DOWNLOAD_BYTES,
+  normalizeSlackFileId,
+  sanitizeDownloadFilename,
+} from './utils/file-download.js';
+import type { FileDownloadOptions } from './utils/file-download.js';
+import { logger } from './utils/logger.js';
+import {
+  assertAllowedSlackUrl,
+  normalizeSlackWorkspaceUrl,
+  validateSlackCookie,
+} from './utils/validation.js';
 
 export type UserRecord = {
   id: string;
@@ -41,11 +63,31 @@ interface UserCacheData {
   workspace_id: string;
 }
 
+interface SlackDownloadStream {
+  stream: AsyncIterable<Uint8Array> & { destroy?: () => void };
+  contentType: string;
+  contentLength?: number;
+  redirectCount: number;
+  finalUrl: URL;
+}
+
 export interface SearchUsersIncrementalResult {
   results: Array<UserRecord & { score: number }>;
   source: 'cache' | 'api';
   exhaustive: boolean;
+  scannedUsers: number;
+  nextCursor?: string;
 }
+
+export interface SearchUsersIncrementalOptions {
+  earlyStopThreshold?: number;
+  skipCache?: boolean;
+  forceFullScan?: boolean;
+  maxPages?: number;
+  cursor?: string;
+}
+
+type SlackApiField = string | number | boolean | undefined;
 
 export class SlackClient {
   private client: AxiosInstance;
@@ -60,21 +102,34 @@ export class SlackClient {
   private userListCache: UserCacheData | null = null;
   private userCacheFile: string;
   private retryDelay = 1000; // milliseconds
+  private readonly maxTransientAttempts = 3;
+  private readonly requestSignal = new AsyncLocalStorage<AbortSignal>();
+  private readonly userCacheTtlMs = 60 * 60 * 1000;
+  private readonly userLookupConcurrency = 8;
+  private downloadDirectoryCleanup: Promise<void> | undefined;
 
   constructor(config: SlackClientConfig) {
     // Validate cookie
     validateSlackCookie(config.cookieD);
-    
+
     this.cookieD = config.cookieD;
-    this.workspaceUrl = config.workspaceUrl;
+    this.workspaceUrl = config.workspaceUrl
+      ? normalizeSlackWorkspaceUrl(config.workspaceUrl)
+      : undefined;
     this.userAgent = config.userAgent || 'Slack-MCP-Client/1.0';
-    
+
     // Configure user list cache file path
-    this.userCacheFile = config.userCacheFile || '/tmp/slack-mcp-users-cache.json';
-    
+    const workspaceCacheKey = createHash('sha256')
+      .update(this.workspaceUrl || 'unknown-workspace')
+      .digest('hex')
+      .slice(0, 12);
+    this.userCacheFile =
+      config.userCacheFile ||
+      path.join(os.tmpdir(), 'slack-local-mcp', `users-${workspaceCacheKey}.json`);
+
     // Create workspace client for initial token fetch
     this.workspaceClient = axios.create({
-      timeout: 30000,
+      timeout: 15000,
       headers: {
         'User-Agent': this.userAgent,
       },
@@ -88,7 +143,7 @@ export class SlackClient {
     // Create axios instance with default configuration
     this.client = axios.create({
       baseURL: 'https://slack.com/api',
-      timeout: 30000,
+      timeout: 15000,
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
         'User-Agent': this.userAgent,
@@ -98,13 +153,14 @@ export class SlackClient {
     // Add request interceptor for logging
     this.client.interceptors.request.use(
       (config) => {
+        config.signal ??= this.requestSignal.getStore();
         logger.debug(`API Request: ${config.method?.toUpperCase()} ${config.url}`);
         return config;
       },
       (error) => {
         logger.error('Request interceptor error', error);
         return Promise.reject(error);
-      }
+      },
     );
 
     // Add response interceptor for logging and error handling
@@ -117,21 +173,29 @@ export class SlackClient {
         return response;
       },
       async (error: AxiosError) => {
-        // Handle rate limiting with retry
-        if (error.response?.status === 429) {
+        const retryConfig = error.config as
+          (NonNullable<AxiosError['config']> & { slackRateLimitRetried?: boolean }) | undefined;
+
+        // Retry a rate-limited API request once. Higher-level file operations
+        // also have their own bounded retry budget.
+        if (error.response?.status === 429 && retryConfig && !retryConfig.slackRateLimitRetried) {
+          retryConfig.slackRateLimitRetried = true;
           const retryAfter = error.response.headers['retry-after'];
-          const delay = retryAfter ? parseInt(retryAfter, 10) * 1000 : this.retryDelay;
-          
+          const parsedRetryAfter = retryAfter
+            ? parseInt(String(retryAfter), 10) * 1000
+            : this.retryDelay;
+          const delay = Number.isFinite(parsedRetryAfter)
+            ? Math.min(parsedRetryAfter, 30_000)
+            : this.retryDelay;
+
           logger.warn(`Rate limited, retrying after ${delay}ms`);
-          
+
           await this.sleep(delay);
           // Retry the request once
-          if (error.config) {
-            return this.client.request(error.config);
-          }
+          return this.client.request(retryConfig);
         }
         return Promise.reject(error);
-      }
+      },
     );
   }
 
@@ -139,29 +203,203 @@ export class SlackClient {
    * Sleep utility for delays
    */
   private sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+    const signal = this.requestSignal.getStore();
+    if (signal?.aborted) {
+      return Promise.reject(
+        signal.reason instanceof Error
+          ? signal.reason
+          : Object.assign(new Error('Cancelled'), { name: 'AbortError' }),
+      );
+    }
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        signal?.removeEventListener('abort', onAbort);
+        resolve();
+      }, ms);
+      const onAbort = () => {
+        clearTimeout(timer);
+        reject(
+          signal?.reason instanceof Error
+            ? signal.reason
+            : Object.assign(new Error('Cancelled'), { name: 'AbortError' }),
+        );
+      };
+      signal?.addEventListener('abort', onAbort, { once: true });
+    });
+  }
+
+  async withRequestSignal<T>(
+    signal: AbortSignal | undefined,
+    action: () => Promise<T>,
+  ): Promise<T> {
+    if (!signal) {
+      return action();
+    }
+    if (signal.aborted) {
+      throw signal.reason instanceof Error
+        ? signal.reason
+        : Object.assign(new Error('Cancelled'), { name: 'AbortError' });
+    }
+    return this.requestSignal.run(signal, action);
+  }
+
+  private isTransientNetworkError(error: unknown): boolean {
+    if (!error || typeof error !== 'object') return false;
+    const candidate = error as {
+      code?: string;
+      response?: { status?: number };
+    };
+    const transientCodes = new Set([
+      'ECONNRESET',
+      'ECONNREFUSED',
+      'ECONNABORTED',
+      'EPIPE',
+      'ETIMEDOUT',
+      'EAI_AGAIN',
+      'EHOSTUNREACH',
+      'ENETDOWN',
+      'ENETUNREACH',
+      'ERR_STREAM_PREMATURE_CLOSE',
+    ]);
+    return (
+      (candidate.code ? transientCodes.has(candidate.code) : false) ||
+      [502, 503, 504].includes(candidate.response?.status || 0)
+    );
+  }
+
+  private getRetryDelay(error: unknown, attempt: number): number {
+    if (error && typeof error === 'object' && 'response' in error) {
+      const response = (
+        error as {
+          response?: { headers?: Record<string, string | string[] | undefined> };
+        }
+      ).response;
+      const retryAfter = response?.headers?.['retry-after'];
+      const value = Array.isArray(retryAfter) ? retryAfter[0] : retryAfter;
+      const seconds = value ? Number.parseInt(value, 10) : Number.NaN;
+      if (Number.isFinite(seconds) && seconds >= 0) {
+        return Math.min(seconds * 1000, 30_000);
+      }
+    }
+    return this.retryDelay * attempt;
+  }
+
+  private async withTransientRetry<T>(operation: string, action: () => Promise<T>): Promise<T> {
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= this.maxTransientAttempts; attempt += 1) {
+      try {
+        return await action();
+      } catch (error) {
+        lastError = error;
+        if (!this.isTransientNetworkError(error) || attempt === this.maxTransientAttempts) {
+          throw error;
+        }
+        const delay = this.getRetryDelay(error, attempt);
+        logger.warn(`${operation} hit a transient network error; retrying`, {
+          attempt,
+          max_attempts: this.maxTransientAttempts,
+          delay_ms: delay,
+          code: (error as { code?: string }).code,
+        });
+        await this.sleep(delay);
+      }
+    }
+    throw lastError;
+  }
+
+  private requireApiToken(): string {
+    if (!this.apiToken) {
+      throw new AuthenticationError('Slack client is not authenticated');
+    }
+    return this.apiToken;
+  }
+
+  private requireWorkspaceId(): string {
+    if (!this.workspaceId) {
+      throw new AuthenticationError('Slack workspace is not authenticated');
+    }
+    return this.workspaceId;
+  }
+
+  private createAuthenticatedForm(fields: Record<string, SlackApiField>): URLSearchParams {
+    const formData = new URLSearchParams();
+    for (const [name, value] of Object.entries(this.createAuthenticatedParams(fields))) {
+      formData.append(name, String(value));
+    }
+    return formData;
+  }
+
+  private createAuthenticatedParams(
+    fields: Record<string, SlackApiField> = {},
+  ): Record<string, Exclude<SlackApiField, undefined>> {
+    const params: Record<string, Exclude<SlackApiField, undefined>> = {
+      token: this.requireApiToken(),
+    };
+    for (const [name, value] of Object.entries(fields)) {
+      if (value !== undefined) {
+        params[name] = value;
+      }
+    }
+    return params;
+  }
+
+  private getCookieHeaders(): { Cookie: string } {
+    return { Cookie: `d=${this.cookieD}` };
+  }
+
+  private async getSlackApi<T extends SlackApiResponse>(
+    endpoint: string,
+    fields: Record<string, SlackApiField> = {},
+  ): Promise<T> {
+    const response = await this.client.get<T>(endpoint, {
+      params: this.createAuthenticatedParams(fields),
+      headers: this.getCookieHeaders(),
+    });
+    return response.data;
+  }
+
+  private async postSlackApi<T extends SlackApiResponse>(
+    endpoint: string,
+    fields: Record<string, SlackApiField>,
+  ): Promise<T> {
+    const response = await this.client.post<T>(endpoint, this.createAuthenticatedForm(fields), {
+      headers: this.getCookieHeaders(),
+    });
+    return response.data;
+  }
+
+  private assertSlackOk<T extends SlackApiResponse>(response: T, fallbackMessage: string): T {
+    if (!response.ok) {
+      throw new Error(response.error || fallbackMessage);
+    }
+    return response;
+  }
+
+  private async withSlackError<T>(context: string, action: () => Promise<T>): Promise<T> {
+    try {
+      return await action();
+    } catch (error) {
+      throw handleSlackError(error, context);
+    }
   }
 
   /**
    * Fetch API token from workspace using the d cookie
    */
   private async fetchApiToken(workspaceUrl: string): Promise<string> {
-    try {
+    return this.withSlackError('fetch_api_token', async () => {
       logger.debug('Fetching API token from workspace...');
-      
-      const response = await this.workspaceClient.get(`${workspaceUrl}/ssb/redirect`, {
-        headers: {
-          Cookie: `d=${this.cookieD}`,
-        },
-        responseType: 'text', // Ensure we get text, not parsed JSON
-      });
-      
+
+      const response = await this.withTransientRetry('Slack token fetch', () =>
+        this.fetchWorkspaceHtml(workspaceUrl),
+      );
+
       // Extract api_token from the response HTML
       const html = String(response.data);
-      
+
       // Try to find the api_token in the boot_data
       const match = html.match(/"api_token"\s*:\s*"([^"]+)"/);
-      
+
       if (!match || !match[1]) {
         logger.error('Failed to extract API token. Response length:', html.length);
         logger.debug('Response type:', typeof response.data);
@@ -169,19 +407,55 @@ export class SlackClient {
         const hasApiToken = html.includes('api_token');
         logger.debug('Contains "api_token":', hasApiToken);
         if (hasApiToken) {
-          const context = html.substring(html.indexOf('api_token') - 50, html.indexOf('api_token') + 150);
+          const context = html.substring(
+            html.indexOf('api_token') - 50,
+            html.indexOf('api_token') + 150,
+          );
           logger.debug('Context around api_token:', context);
         }
         throw new AuthenticationError('Failed to extract API token from workspace response');
       }
-      
+
       const apiToken = match[1];
       logger.debug('API token fetched successfully');
-      
+
       return apiToken;
-    } catch (error) {
-      throw handleSlackError(error, 'fetch_api_token');
+    });
+  }
+
+  private async fetchWorkspaceHtml(workspaceUrl: string): Promise<{ data: string }> {
+    let currentUrl = new URL('/ssb/redirect', `${normalizeSlackWorkspaceUrl(workspaceUrl)}/`);
+    const maxRedirects = 5;
+
+    for (let redirectCount = 0; redirectCount <= maxRedirects; redirectCount += 1) {
+      const response = await this.workspaceClient.get(currentUrl.href, {
+        headers: { Cookie: `d=${this.cookieD}` },
+        responseType: 'text',
+        maxRedirects: 0,
+        signal: this.requestSignal.getStore(),
+        validateStatus: (status) => status >= 200 && status < 400,
+      });
+
+      if ([301, 302, 303, 307, 308].includes(response.status)) {
+        const locationHeader = response.headers.location;
+        const location = Array.isArray(locationHeader) ? locationHeader[0] : locationHeader;
+        if (!location) {
+          throw new ValidationError('Slack workspace redirect did not include a Location header');
+        }
+        if (redirectCount === maxRedirects) {
+          throw new ValidationError(`Slack workspace request exceeded ${maxRedirects} redirects`);
+        }
+        currentUrl = assertAllowedSlackUrl(new URL(String(location), currentUrl).href);
+        continue;
+      }
+
+      if (response.status !== 200) {
+        throw new Error(`Slack workspace request returned HTTP ${response.status}`);
+      }
+      return { data: String(response.data) };
     }
+
+    throw new ValidationError('Slack workspace redirect handling failed');
   }
 
   /**
@@ -192,61 +466,63 @@ export class SlackClient {
     if (this.workspaceUrl) {
       return this.workspaceUrl;
     }
-    
+
     // Try to detect from a test call or environment
     // For now, we'll throw an error asking user to provide it
     throw new AuthenticationError(
-      'Workspace URL is required. Please provide it in the configuration (e.g., https://your-workspace.slack.com)'
+      'Workspace URL is required. Please provide it in the configuration (e.g., https://your-workspace.slack.com)',
     );
   }
 
   /**
    * Authenticate and validate the cookie
    */
-  async authenticate(): Promise<void> {
-    try {
-      logger.info('Authenticating with Slack...');
-      
-      // Determine the workspace URL
-      const workspaceUrl = await this.detectWorkspaceUrl();
-      
-      // Fetch the API token using the d cookie
-      this.apiToken = await this.fetchApiToken(workspaceUrl);
-      this.workspaceUrl = workspaceUrl;
-      
-      // Now authenticate with both cookie and token
-      const params = new URLSearchParams();
-      params.append('token', this.apiToken);
-      
-      const response = await this.client.post<SlackAuthTestResponse>(
-        '/auth.test',
-        params,
-        {
-          headers: {
-            Cookie: `d=${this.cookieD}`,
-          },
-        }
-      );
-      
-      if (!response.data.ok) {
-        throw new AuthenticationError(
-          'Authentication failed: ' + (response.data.error || 'Unknown error')
+  async authenticate(signal?: AbortSignal): Promise<void> {
+    return this.withRequestSignal(signal, () =>
+      this.withSlackError('authentication', async () => {
+        logger.info('Authenticating with Slack...');
+
+        // Determine the workspace URL
+        const workspaceUrl = await this.detectWorkspaceUrl();
+
+        // Fetch the API token using the d cookie
+        this.apiToken = await this.fetchApiToken(workspaceUrl);
+        this.workspaceUrl = workspaceUrl;
+
+        const response = await this.withTransientRetry('Slack authentication', () =>
+          this.postSlackApi<SlackAuthTestResponse>('/auth.test', {}),
         );
-      }
 
-      this.workspaceId = response.data.team_id;
-      this.userId = response.data.user_id;
-      this.workspaceUrl = response.data.url;
+        if (!response.ok) {
+          throw new AuthenticationError(
+            'Authentication failed: ' + (response.error || 'Unknown error'),
+          );
+        }
 
-      logger.info('Authentication successful', {
-        workspace: response.data.team,
-        user: response.data.user,
-        team_id: this.workspaceId,
-        user_id: this.userId,
-      });
-    } catch (error) {
-      throw handleSlackError(error, 'authentication');
+        this.workspaceId = response.team_id;
+        this.userId = response.user_id;
+        this.workspaceUrl = response.url ? normalizeSlackWorkspaceUrl(response.url) : workspaceUrl;
+
+        logger.info('Authentication successful', {
+          workspace: response.team,
+          user: response.user,
+          team_id: this.workspaceId,
+          user_id: this.userId,
+        });
+      }),
+    );
+  }
+
+  /**
+   * Return the user established by auth.test. This is intentionally not
+   * exposed as an MCP tool, but lets guarded integration tests prove that a
+   * requested self-only write target is the authenticated account.
+   */
+  getAuthenticatedUserId(): string {
+    if (!this.userId) {
+      throw new AuthenticationError('Slack client is not authenticated');
     }
+    return this.userId;
   }
 
   /**
@@ -257,43 +533,32 @@ export class SlackClient {
     text: string;
     thread_ts?: string;
     unfurl_links?: boolean;
+    reply_broadcast?: boolean;
   }): Promise<SlackMessageResponse> {
-    try {
+    return this.withSlackError('send_message', async () => {
       logger.info('Sending message', {
         channel: params.channel,
         thread: params.thread_ts || 'none',
       });
 
-      const formData = new URLSearchParams();
-      formData.append('token', this.apiToken!);
-      formData.append('channel', params.channel);
-      formData.append('text', params.text);
-      if (params.thread_ts) formData.append('thread_ts', params.thread_ts);
-      formData.append('unfurl_links', String(params.unfurl_links ?? true));
-      
-      const response = await this.client.post<SlackMessageResponse>(
-        '/chat.postMessage',
-        formData,
-        {
-          headers: {
-            Cookie: `d=${this.cookieD}`,
-          },
-        }
+      const response = this.assertSlackOk(
+        await this.postSlackApi<SlackMessageResponse>('/chat.postMessage', {
+          channel: params.channel,
+          text: params.text,
+          thread_ts: params.thread_ts || undefined,
+          unfurl_links: params.unfurl_links ?? true,
+          reply_broadcast: params.reply_broadcast || undefined,
+        }),
+        'Failed to send message',
       );
 
-      if (!response.data.ok) {
-        throw new Error(response.data.error || 'Failed to send message');
-      }
-
       logger.info('Message sent successfully', {
-        channel: response.data.channel,
-        ts: response.data.ts,
+        channel: response.channel,
+        ts: response.ts,
       });
 
-      return response.data;
-    } catch (error) {
-      throw handleSlackError(error, 'send_message');
-    }
+      return response;
+    });
   }
 
   /**
@@ -304,79 +569,50 @@ export class SlackClient {
     ts: string;
     text: string;
   }): Promise<SlackMessageResponse> {
-    try {
+    return this.withSlackError('update_message', async () => {
       logger.info('Updating message', {
         channel: params.channel,
         ts: params.ts,
       });
 
-      const formData = new URLSearchParams();
-      formData.append('token', this.apiToken!);
-      formData.append('channel', params.channel);
-      formData.append('ts', params.ts);
-      formData.append('text', params.text);
-      
-      const response = await this.client.post<SlackMessageResponse>(
-        '/chat.update',
-        formData,
-        {
-          headers: {
-            Cookie: `d=${this.cookieD}`,
-          },
-        }
+      const response = this.assertSlackOk(
+        await this.postSlackApi<SlackMessageResponse>('/chat.update', {
+          channel: params.channel,
+          ts: params.ts,
+          text: params.text,
+        }),
+        'Failed to update message',
       );
 
-      if (!response.data.ok) {
-        throw new Error(response.data.error || 'Failed to update message');
-      }
-
       logger.info('Message updated successfully', {
-        channel: response.data.channel,
-        ts: response.data.ts,
+        channel: response.channel,
+        ts: response.ts,
       });
 
-      return response.data;
-    } catch (error) {
-      throw handleSlackError(error, 'update_message');
-    }
+      return response;
+    });
   }
 
   /**
    * Delete a message
    */
-  async deleteMessage(params: {
-    channel: string;
-    ts: string;
-  }): Promise<void> {
-    try {
+  async deleteMessage(params: { channel: string; ts: string }): Promise<void> {
+    return this.withSlackError('delete_message', async () => {
       logger.info('Deleting message', {
         channel: params.channel,
         ts: params.ts,
       });
 
-      const formData = new URLSearchParams();
-      formData.append('token', this.apiToken!);
-      formData.append('channel', params.channel);
-      formData.append('ts', params.ts);
-      
-      const response = await this.client.post<SlackMessageResponse>(
-        '/chat.delete',
-        formData,
-        {
-          headers: {
-            Cookie: `d=${this.cookieD}`,
-          },
-        }
+      this.assertSlackOk(
+        await this.postSlackApi<SlackApiResponse>('/chat.delete', {
+          channel: params.channel,
+          ts: params.ts,
+        }),
+        'Failed to delete message',
       );
 
-      if (!response.data.ok) {
-        throw new Error(response.data.error || 'Failed to delete message');
-      }
-
       logger.info('Message deleted successfully');
-    } catch (error) {
-      throw handleSlackError(error, 'delete_message');
-    }
+    });
   }
 
   /**
@@ -388,42 +624,48 @@ export class SlackClient {
     post_at: number;
     thread_ts?: string;
   }): Promise<SlackScheduledMessageResponse> {
-    try {
+    return this.withSlackError('schedule_message', async () => {
       logger.info('Scheduling message', {
         channel: params.channel,
         post_at: new Date(params.post_at * 1000).toISOString(),
       });
 
-      const formData = new URLSearchParams();
-      formData.append('token', this.apiToken!);
-      formData.append('channel', params.channel);
-      formData.append('text', params.text);
-      formData.append('post_at', String(params.post_at));
-      if (params.thread_ts) formData.append('thread_ts', params.thread_ts);
-      
-      const response = await this.client.post<SlackScheduledMessageResponse>(
-        '/chat.scheduleMessage',
-        formData,
-        {
-          headers: {
-            Cookie: `d=${this.cookieD}`,
-          },
-        }
+      const response = this.assertSlackOk(
+        await this.postSlackApi<SlackScheduledMessageResponse>('/chat.scheduleMessage', {
+          channel: params.channel,
+          text: params.text,
+          post_at: params.post_at,
+          thread_ts: params.thread_ts || undefined,
+        }),
+        'Failed to schedule message',
       );
 
-      if (!response.data.ok) {
-        throw new Error(response.data.error || 'Failed to schedule message');
-      }
-
       logger.info('Message scheduled successfully', {
-        scheduled_message_id: response.data.scheduled_message_id,
-        post_at: response.data.post_at,
+        scheduled_message_id: response.scheduled_message_id,
+        post_at: response.post_at,
       });
 
-      return response.data;
-    } catch (error) {
-      throw handleSlackError(error, 'schedule_message');
-    }
+      return response;
+    });
+  }
+
+  /**
+   * Cancel a scheduled message. Kept at the client layer so live tests can
+   * clean up a successful schedule without expanding the public MCP surface.
+   */
+  async deleteScheduledMessage(params: {
+    channel: string;
+    scheduled_message_id: string;
+  }): Promise<void> {
+    return this.withSlackError('delete_scheduled_message', async () => {
+      this.assertSlackOk(
+        await this.postSlackApi<SlackApiResponse>('/chat.deleteScheduledMessage', {
+          channel: params.channel,
+          scheduled_message_id: params.scheduled_message_id,
+        }),
+        'Failed to delete scheduled message',
+      );
+    });
   }
 
   /**
@@ -435,38 +677,26 @@ export class SlackClient {
     oldest?: string;
     latest?: string;
   }): Promise<SlackMessage[]> {
-    try {
+    return this.withSlackError('fetch_messages', async () => {
       logger.info('Fetching messages', {
         channel: params.channel,
         limit: params.limit || 50,
       });
 
-      const response = await this.client.get<SlackConversationsHistoryResponse>(
-        '/conversations.history',
-        {
-          params: {
-            token: this.apiToken!,
-            channel: params.channel,
-            limit: params.limit || 50,
-            oldest: params.oldest,
-            latest: params.latest,
-          },
-          headers: {
-            Cookie: `d=${this.cookieD}`,
-          },
-        }
+      const response = this.assertSlackOk(
+        await this.getSlackApi<SlackConversationsHistoryResponse>('/conversations.history', {
+          channel: params.channel,
+          limit: params.limit || 50,
+          oldest: params.oldest,
+          latest: params.latest,
+        }),
+        'Failed to fetch messages',
       );
 
-      if (!response.data.ok) {
-        throw new Error(response.data.error || 'Failed to fetch messages');
-      }
+      logger.info(`Fetched ${response.messages.length} messages`);
 
-      logger.info(`Fetched ${response.data.messages.length} messages`);
-
-      return response.data.messages;
-    } catch (error) {
-      throw handleSlackError(error, 'fetch_messages');
-    }
+      return response.messages;
+    });
   }
 
   /**
@@ -477,301 +707,325 @@ export class SlackClient {
     thread_ts: string;
     limit?: number;
   }): Promise<SlackMessage[]> {
-    try {
+    return this.withSlackError('fetch_thread_replies', async () => {
       logger.info('Fetching thread replies', {
         channel: params.channel,
         thread_ts: params.thread_ts,
       });
 
-      const response = await this.client.get<SlackConversationsRepliesResponse>(
-        '/conversations.replies',
-        {
-          params: {
-            token: this.apiToken!,
-            channel: params.channel,
-            ts: params.thread_ts,
-            limit: params.limit || 100,
-          },
-          headers: {
-            Cookie: `d=${this.cookieD}`,
-          },
-        }
+      const response = this.assertSlackOk(
+        await this.getSlackApi<SlackConversationsRepliesResponse>('/conversations.replies', {
+          channel: params.channel,
+          ts: params.thread_ts,
+          limit: params.limit || 100,
+        }),
+        'Failed to fetch thread replies',
       );
 
-      if (!response.data.ok) {
-        throw new Error(response.data.error || 'Failed to fetch thread replies');
+      logger.info(`Fetched ${response.messages.length} thread replies`);
+
+      return response.messages;
+    });
+  }
+
+  /**
+   * Fetch metadata for a Slack file without exposing its private download URL.
+   */
+  async getFileInfo(fileId: string): Promise<SlackFile> {
+    return this.withSlackError('get_file_info', async () => {
+      logger.info('Fetching Slack file metadata', { file_id: fileId });
+      const response = await this.withTransientRetry('Slack files.info', () =>
+        this.getSlackApi<SlackFilesInfoResponse>('/files.info', { file: fileId }),
+      );
+
+      this.assertSlackOk(response, 'Failed to fetch file information');
+      if (!response.file) {
+        throw new Error('Failed to fetch file information');
+      }
+      return response.file;
+    });
+  }
+
+  private async openSlackDownloadStream(startUrl: string): Promise<SlackDownloadStream> {
+    let currentUrl = assertAllowedSlackDownloadUrl(startUrl);
+    const maxRedirects = 5;
+
+    for (let redirectCount = 0; redirectCount <= maxRedirects; redirectCount += 1) {
+      const response = await axios.get(currentUrl.href, {
+        timeout: 30_000,
+        signal: this.requestSignal.getStore(),
+        responseType: 'stream',
+        maxRedirects: 0,
+        decompress: false,
+        validateStatus: (status) => status >= 200 && status < 400,
+        headers: {
+          Authorization: `Bearer ${this.requireApiToken()}`,
+          Cookie: `d=${this.cookieD}`,
+          'User-Agent': this.userAgent,
+        },
+      });
+
+      if ([301, 302, 303, 307, 308].includes(response.status)) {
+        response.data?.destroy?.();
+        const locationHeader = response.headers.location;
+        const location = Array.isArray(locationHeader) ? locationHeader[0] : locationHeader;
+        if (!location) {
+          throw new ValidationError('Slack returned a redirect without a Location header');
+        }
+        if (redirectCount === maxRedirects) {
+          throw new ValidationError(`Slack file download exceeded ${maxRedirects} redirects`);
+        }
+        currentUrl = assertAllowedSlackDownloadUrl(new URL(String(location), currentUrl).href);
+        continue;
       }
 
-      logger.info(`Fetched ${response.data.messages.length} thread replies`);
+      if (response.status !== 200) {
+        response.data?.destroy?.();
+        throw Object.assign(new Error(`Slack file download returned HTTP ${response.status}`), {
+          response: {
+            status: response.status,
+            headers: response.headers,
+          },
+        });
+      }
 
-      return response.data.messages;
-    } catch (error) {
-      throw handleSlackError(error, 'fetch_thread_replies');
+      const lengthHeader = response.headers['content-length'];
+      const lengthValue = lengthHeader ? String(lengthHeader).trim() : '';
+      const parsedLength = /^\d+$/.test(lengthValue) ? Number(lengthValue) : Number.NaN;
+      return {
+        stream: response.data as SlackDownloadStream['stream'],
+        contentType: String(response.headers['content-type'] || 'application/octet-stream')
+          .split(';', 1)[0]
+          .trim()
+          .toLowerCase(),
+        contentLength:
+          Number.isSafeInteger(parsedLength) && parsedLength >= 0 ? parsedLength : undefined,
+        redirectCount,
+        finalUrl: currentUrl,
+      };
     }
+
+    throw new ValidationError('Slack file download redirect handling failed');
+  }
+
+  private async downloadFileOnce(
+    file: SlackFile,
+    downloadUrl: string,
+    finalPath: string,
+    options: FileDownloadOptions,
+  ): Promise<FileDownloadResult> {
+    const temporaryPath = `${finalPath}.${randomUUID()}.part`;
+    let handle: Awaited<ReturnType<typeof fsPromises.open>> | undefined;
+    let stream: SlackDownloadStream['stream'] | undefined;
+
+    try {
+      const response = await this.openSlackDownloadStream(downloadUrl);
+      stream = response.stream;
+
+      if (
+        response.contentLength !== undefined &&
+        response.contentLength >= MAX_FILE_DOWNLOAD_BYTES
+      ) {
+        throw new ValidationError('Slack response exceeds the 20 MiB download limit');
+      }
+      if (response.contentLength !== undefined && response.contentLength !== file.size) {
+        throw new ValidationError('Slack response size does not match files.info metadata');
+      }
+      const expectedCategory = classifySlackFile(file.mimetype);
+      const responseCategory = classifySlackFile(response.contentType);
+      const responseSkipReason = getFileCategorySkipReason(responseCategory, options);
+      if (responseSkipReason) {
+        throw new ValidationError(`Slack response was rejected: ${responseSkipReason}`);
+      }
+      if (expectedCategory !== 'other' && responseCategory !== expectedCategory) {
+        throw new ValidationError(
+          `Slack returned ${response.contentType} for a ${expectedCategory} file; download was rejected`,
+        );
+      }
+
+      handle = await fsPromises.open(temporaryPath, 'wx', 0o600);
+      const hash = createHash('sha256');
+      let bytes = 0;
+
+      for await (const chunk of stream) {
+        const buffer = Buffer.from(chunk);
+        bytes += buffer.length;
+        if (bytes >= MAX_FILE_DOWNLOAD_BYTES) {
+          throw new ValidationError('Downloaded content reached the 20 MiB limit');
+        }
+        hash.update(buffer);
+        let offset = 0;
+        while (offset < buffer.length) {
+          const { bytesWritten } = await handle.write(buffer, offset, buffer.length - offset, null);
+          if (bytesWritten <= 0) {
+            throw new Error('Temporary Slack file write made no progress');
+          }
+          offset += bytesWritten;
+        }
+      }
+
+      if (bytes !== file.size) {
+        throw new ValidationError(
+          `Downloaded ${bytes} bytes but files.info reported ${file.size} bytes`,
+        );
+      }
+
+      await handle.sync();
+      await handle.close();
+      handle = undefined;
+      await fsPromises.rename(temporaryPath, finalPath);
+
+      return {
+        path: finalPath,
+        bytes,
+        sha256: hash.digest('hex'),
+        content_type: response.contentType,
+        redirect_count: response.redirectCount,
+        final_host: response.finalUrl.hostname,
+      };
+    } catch (error) {
+      stream?.destroy?.();
+      if (handle) {
+        await handle.close().catch(() => undefined);
+      }
+      await fsPromises.unlink(temporaryPath).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  /**
+   * Download a previously validated Slack-hosted file into the OS temp folder.
+   */
+  async downloadFile(
+    file: SlackFile,
+    options: FileDownloadOptions = {},
+  ): Promise<FileDownloadResult> {
+    return this.withSlackError('download_file', async () => {
+      const fileSize = file.size;
+      if (typeof fileSize !== 'number' || !Number.isSafeInteger(fileSize) || fileSize < 0) {
+        throw new ValidationError('Slack file size is missing or invalid');
+      }
+      if (fileSize >= MAX_FILE_DOWNLOAD_BYTES) {
+        throw new ValidationError('Slack file must be strictly smaller than 20 MiB');
+      }
+      if (file.is_external || file.mode === 'external') {
+        throw new ValidationError('External or remote Slack files are metadata-only');
+      }
+
+      const privateUrl = file.url_private_download || file.url_private;
+      if (!privateUrl) {
+        throw new ValidationError('Slack did not provide a private download URL');
+      }
+      assertAllowedSlackDownloadUrl(privateUrl);
+
+      const safeFileId = normalizeSlackFileId(file.id);
+      const outputDirectory = path.join(os.tmpdir(), 'slack-local-mcp');
+      await fsPromises.mkdir(outputDirectory, { recursive: true, mode: 0o700 });
+      this.downloadDirectoryCleanup ??= cleanupSlackDownloadDirectory(outputDirectory)
+        .then((removed) => {
+          if (removed > 0) logger.info(`Removed ${removed} expired Slack temp file(s)`);
+        })
+        .catch((error: unknown) => {
+          logger.warn('Failed to clean expired Slack temp files', error);
+        });
+      await this.downloadDirectoryCleanup;
+      const filename = sanitizeDownloadFilename(file.name || file.title || safeFileId, safeFileId);
+      const finalPath = path.join(
+        outputDirectory,
+        `${safeFileId}-${Date.now()}-${randomUUID().slice(0, 8)}-${filename}`,
+      );
+
+      return await this.withTransientRetry('Slack file download', () =>
+        this.downloadFileOnce(file, privateUrl, finalPath, options),
+      );
+    });
   }
 
   /**
    * Add a reaction to a message
    */
-  async addReaction(params: {
-    channel: string;
-    timestamp: string;
-    name: string;
-  }): Promise<void> {
-    try {
+  async addReaction(params: { channel: string; timestamp: string; name: string }): Promise<void> {
+    return this.withSlackError('add_reaction', async () => {
       logger.info('Adding reaction', {
         channel: params.channel,
         timestamp: params.timestamp,
         emoji: params.name,
       });
 
-      const formData = new URLSearchParams();
-      formData.append('token', this.apiToken!);
-      formData.append('channel', params.channel);
-      formData.append('timestamp', params.timestamp);
-      formData.append('name', params.name);
-      
-      const response = await this.client.post<SlackReactionsAddResponse>(
-        '/reactions.add',
-        formData,
-        {
-          headers: {
-            Cookie: `d=${this.cookieD}`,
-          },
-        }
-      );
+      const response = await this.postSlackApi<SlackReactionsAddResponse>('/reactions.add', {
+        channel: params.channel,
+        timestamp: params.timestamp,
+        name: params.name,
+      });
 
-      if (!response.data.ok) {
+      if (!response.ok) {
         // Handle "already_reacted" gracefully
-        if (response.data.error === 'already_reacted') {
+        if (response.error === 'already_reacted') {
           logger.info('Reaction already exists, skipping');
           return;
         }
-        throw new Error(response.data.error || 'Failed to add reaction');
+        this.assertSlackOk(response, 'Failed to add reaction');
       }
 
       logger.info('Reaction added successfully');
-    } catch (error) {
-      throw handleSlackError(error, 'add_reaction');
-    }
+    });
   }
-  /**
-   * List all reminders
-   */
-  async listReminders(): Promise<SlackReminder[]> {
-    try {
-      logger.info('Fetching reminders list');
-
-      const response = await this.client.get<SlackRemindersListResponse>('/reminders.list', {
-        params: {
-          token: this.apiToken!,
-        },
-        headers: {
-          Cookie: `d=${this.cookieD}`,
-        },
-      });
-
-      if (!response.data.ok) {
-        throw new Error(response.data.error || 'Failed to list reminders');
-      }
-
-      logger.info(`Fetched ${response.data.reminders.length} reminders`);
-
-      return response.data.reminders;
-    } catch (error) {
-      throw handleSlackError(error, 'list_reminders');
-    }
-  }
-
-  /**
-   * Create a new reminder
-   */
-  async createReminder(params: {
-    text: string;
-    time: number;
-    user?: string;
-  }): Promise<SlackReminder> {
-    try {
-      logger.info('Creating reminder', {
-        text: params.text,
-        time: new Date(params.time * 1000).toISOString(),
-        user: params.user || 'self',
-      });
-
-      const formData = new URLSearchParams();
-      formData.append('token', this.apiToken!);
-      formData.append('text', params.text);
-      formData.append('time', String(params.time));
-      if (params.user) {
-        formData.append('user', params.user);
-      }
-      
-      const response = await this.client.post<SlackReminderResponse>(
-        '/reminders.add',
-        formData,
-        {
-          headers: {
-            Cookie: `d=${this.cookieD}`,
-          },
-        }
-      );
-
-      if (!response.data.ok) {
-        throw new Error(response.data.error || 'Failed to create reminder');
-      }
-
-      logger.info('Reminder created successfully', {
-        reminder_id: response.data.reminder.id,
-      });
-
-      return response.data.reminder;
-    } catch (error) {
-      throw handleSlackError(error, 'create_reminder');
-    }
-  }
-
-  /**
-   * Complete a reminder
-   */
-  async completeReminder(reminderId: string): Promise<void> {
-    try {
-      logger.info('Completing reminder', { reminderId });
-
-      const formData = new URLSearchParams();
-      formData.append('token', this.apiToken!);
-      formData.append('reminder', reminderId);
-      
-      const response = await this.client.post<SlackReminderResponse>(
-        '/reminders.complete',
-        formData,
-        {
-          headers: {
-            Cookie: `d=${this.cookieD}`,
-          },
-        }
-      );
-
-      if (!response.data.ok) {
-        throw new Error(response.data.error || 'Failed to complete reminder');
-      }
-
-      logger.info('Reminder completed successfully');
-    } catch (error) {
-      throw handleSlackError(error, 'complete_reminder');
-    }
-  }
-
-  /**
-   * Delete a reminder
-   */
-  async deleteReminder(reminderId: string): Promise<void> {
-    try {
-      logger.info('Deleting reminder', { reminderId });
-
-      const formData = new URLSearchParams();
-      formData.append('token', this.apiToken!);
-      formData.append('reminder', reminderId);
-      
-      const response = await this.client.post<SlackReminderResponse>(
-        '/reminders.delete',
-        formData,
-        {
-          headers: {
-            Cookie: `d=${this.cookieD}`,
-          },
-        }
-      );
-
-      if (!response.data.ok) {
-        throw new Error(response.data.error || 'Failed to delete reminder');
-      }
-
-      logger.info('Reminder deleted successfully');
-    } catch (error) {
-      throw handleSlackError(error, 'delete_reminder');
-    }
-  }
-
-
   /**
    * Open a DM conversation with a user
    */
   async openDirectMessage(userId: string): Promise<string> {
-    try {
+    return this.withSlackError('open_dm', async () => {
       logger.info('Opening DM conversation', { userId });
 
-      const formData = new URLSearchParams();
-      formData.append('token', this.apiToken!);
-      formData.append('users', userId);
-      
-      const response = await this.client.post<SlackConversationsOpenResponse>(
-        '/conversations.open',
-        formData,
-        {
-          headers: {
-            Cookie: `d=${this.cookieD}`,
-          },
-        }
+      const response = this.assertSlackOk(
+        await this.postSlackApi<SlackConversationsOpenResponse>('/conversations.open', {
+          users: userId,
+        }),
+        'Failed to open DM',
       );
 
-      if (!response.data.ok) {
-        throw new Error(response.data.error || 'Failed to open DM');
-      }
-
-      const channelId = response.data.channel.id;
+      const channelId = response.channel.id;
       logger.info('DM conversation opened', { channelId });
 
       return channelId;
-    } catch (error) {
-      throw handleSlackError(error, 'open_dm');
-    }
+    });
   }
 
   /**
    * Get user information and cache it
    */
   async getUserInfo(userId: string): Promise<SlackUser> {
-    try {
-      const response = await this.client.get<SlackUsersInfoResponse>('/users.info', {
-        params: {
-          token: this.apiToken!,
-          user: userId
-        },
-        headers: {
-          Cookie: `d=${this.cookieD}`,
-        },
-      });
-
-      if (!response.data.ok) {
-        throw new Error(response.data.error || 'Failed to get user info');
-      }
+    return this.withSlackError('get_user_info', async () => {
+      const response = this.assertSlackOk(
+        await this.getSlackApi<SlackUsersInfoResponse>('/users.info', { user: userId }),
+        'Failed to get user info',
+      );
 
       // Cache the user's display name
-      const displayName = response.data.user.profile.display_name || 
-                         response.data.user.real_name || 
-                         response.data.user.name;
+      const displayName =
+        response.user.profile.display_name || response.user.real_name || response.user.name;
       this.userCache.set(userId, displayName);
 
-      return response.data.user;
-    } catch (error) {
-      // If we can't get user info, just return the user ID
-      logger.warn(`Failed to get user info for ${userId}`, error);
-      throw handleSlackError(error, 'get_user_info');
-    }
+      return response.user;
+    });
   }
 
   /**
    * Get cached username or fetch if not cached
    */
   async resolveUsername(userId: string): Promise<string> {
-    if (this.userCache.has(userId)) {
-      return this.userCache.get(userId)!;
+    const cachedName = this.userCache.get(userId);
+    if (cachedName !== undefined) {
+      return cachedName;
     }
 
     try {
       const user = await this.getUserInfo(userId);
       return user.profile.display_name || user.real_name || user.name;
     } catch (error) {
+      if (error instanceof AuthenticationError || error instanceof CancelledError) {
+        throw error;
+      }
       logger.debug(`Could not resolve username for ${userId}`);
       return userId;
     }
@@ -801,10 +1055,23 @@ export class SlackClient {
         return null;
       }
       const now = Date.now();
-      
+      const age = now - cache.timestamp;
+      if (
+        !Number.isFinite(cache.timestamp) ||
+        cache.timestamp <= 0 ||
+        age < 0 ||
+        age > this.userCacheTtlMs
+      ) {
+        logger.debug('User list cache is stale, ignoring', {
+          age_ms: Number.isFinite(age) ? age : null,
+          ttl_ms: this.userCacheTtlMs,
+        });
+        return null;
+      }
+
       logger.debug('Loaded user list cache from file', {
         users: cache.users.length,
-        age: Math.floor((now - cache.timestamp) / 1000) + 's',
+        age: Math.floor(age / 1000) + 's',
       });
 
       return cache;
@@ -818,20 +1085,36 @@ export class SlackClient {
    * Save user list cache to file
    */
   private saveUserListCache(cache: UserCacheData): void {
+    let temporaryFile: string | undefined;
     try {
       // Ensure directory exists
       const dir = path.dirname(this.userCacheFile);
       if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
+        fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
       }
 
-      fs.writeFileSync(this.userCacheFile, JSON.stringify(cache, null, 2), 'utf-8');
+      temporaryFile = `${this.userCacheFile}.${process.pid}.${randomUUID()}.tmp`;
+      fs.writeFileSync(temporaryFile, JSON.stringify(cache, null, 2), {
+        encoding: 'utf-8',
+        mode: 0o600,
+        flag: 'wx',
+      });
+      fs.renameSync(temporaryFile, this.userCacheFile);
+      temporaryFile = undefined;
       logger.debug('Saved user list cache to file', {
         users: cache.users.length,
         file: this.userCacheFile,
       });
     } catch (error) {
       logger.warn('Failed to save user list cache', error);
+    } finally {
+      if (temporaryFile) {
+        try {
+          fs.unlinkSync(temporaryFile);
+        } catch {
+          // Best-effort cleanup after a concurrent writer or interrupted rename.
+        }
+      }
     }
   }
 
@@ -843,11 +1126,17 @@ export class SlackClient {
   async searchUsersIncremental(
     scoreFn: (user: UserRecord) => number,
     limit: number,
-    earlyStopThreshold: number = 80,
-    skipCache: boolean = false,
+    options: SearchUsersIncrementalOptions = {},
   ): Promise<SearchUsersIncrementalResult> {
+    const earlyStopThreshold = options.earlyStopThreshold ?? 80;
+    const forceFullScan = options.forceFullScan ?? false;
+    const maxPages = forceFullScan
+      ? Number.POSITIVE_INFINITY
+      : Math.max(1, Math.floor(options.maxPages ?? Number.POSITIVE_INFINITY));
+    const startingCursor = options.cursor?.trim() || undefined;
+
     // Phase 1: Try cache first (zero API calls)
-    if (!skipCache) {
+    if (!options.skipCache && !startingCursor) {
       const cached = this.getOrLoadUserListCache();
       if (cached) {
         const scored = cached.users
@@ -855,37 +1144,39 @@ export class SlackClient {
           .filter((s) => s.score > 0)
           .sort((a, b) => b.score - a.score)
           .slice(0, limit);
-        return { results: scored, source: 'cache', exhaustive: true };
+        if (scored.length > 0) {
+          return {
+            results: scored,
+            source: 'cache',
+            exhaustive: true,
+            scannedUsers: 0,
+          };
+        }
+        // A cached miss is not authoritative: a user may have joined since the
+        // snapshot. Fall through to a bounded live search instead.
+        logger.debug('User cache had no matches; checking Slack for newer users');
       }
     }
 
     // Phase 2: Incremental API pagination
-    try {
+    return this.withSlackError('search_users_incremental', async () => {
       logger.info('Searching users via incremental API pagination');
       const allFetchedUsers: UserRecord[] = [];
       const scoredResults: Array<UserRecord & { score: number }> = [];
-      let cursor: string | undefined = undefined;
+      let cursor: string | undefined = startingCursor;
+      let pagesFetched = 0;
       const pageSize = 100;
 
       do {
-        const params: Record<string, string> = {
-          token: this.apiToken!,
-          limit: String(pageSize),
-        };
-        if (cursor) {
-          params.cursor = cursor;
-        }
+        const response: SlackUsersListResponse = this.assertSlackOk(
+          await this.getSlackApi<SlackUsersListResponse>('/users.list', {
+            limit: pageSize,
+            cursor,
+          }),
+          'Failed to list users',
+        );
 
-        const response = await this.client.get('/users.list', {
-          params,
-          headers: { Cookie: `d=${this.cookieD}` },
-        });
-
-        if (!response.data.ok) {
-          throw new Error(response.data.error || 'Failed to list users');
-        }
-
-        const pageUsers: UserRecord[] = (response.data.members || [])
+        const pageUsers: UserRecord[] = (response.members || [])
           .filter((u: SlackUser) => !u.deleted && !u.is_bot)
           .map((u: SlackUser) => ({
             id: u.id,
@@ -895,6 +1186,7 @@ export class SlackClient {
           }));
 
         allFetchedUsers.push(...pageUsers);
+        pagesFetched += 1;
 
         // Side effect: populate in-memory userCache for resolveUsername
         for (const u of pageUsers) {
@@ -911,17 +1203,36 @@ export class SlackClient {
         // Keep sorted
         scoredResults.sort((a, b) => b.score - a.score);
 
-        logger.debug(`Paginated ${allFetchedUsers.length} users so far, ${scoredResults.length} matches`);
+        logger.debug(
+          `Paginated ${allFetchedUsers.length} users so far, ${scoredResults.length} matches`,
+        );
 
-        cursor = response.data.response_metadata?.next_cursor || undefined;
+        cursor = response.response_metadata?.next_cursor || undefined;
 
         // Early termination: enough high-confidence matches AND more pages remain
-        if (cursor && scoredResults.length >= limit) {
+        if (!forceFullScan && cursor && scoredResults.length >= limit) {
           const topN = scoredResults.slice(0, limit);
           if (topN.every((r) => r.score >= earlyStopThreshold)) {
             logger.info(`Early stop: found ${limit} matches scoring >= ${earlyStopThreshold}`);
-            return { results: topN, source: 'api', exhaustive: false };
+            return {
+              results: topN,
+              source: 'api',
+              exhaustive: false,
+              scannedUsers: allFetchedUsers.length,
+              nextCursor: cursor,
+            };
           }
+        }
+
+        if (!forceFullScan && cursor && pagesFetched >= maxPages) {
+          logger.info(`User search paused after ${pagesFetched} page(s)`);
+          return {
+            results: scoredResults.slice(0, limit),
+            source: 'api',
+            exhaustive: false,
+            scannedUsers: allFetchedUsers.length,
+            nextCursor: cursor,
+          };
         }
 
         if (cursor) {
@@ -929,25 +1240,25 @@ export class SlackClient {
         }
       } while (cursor);
 
-      // Exhausted all pages — save full list to file cache
-      const cache: UserCacheData = {
-        users: allFetchedUsers,
-        timestamp: Date.now(),
-        workspace_id: this.workspaceId!,
-      };
-      this.userListCache = cache;
-      this.saveUserListCache(cache);
-      logger.info(`Full pagination complete: ${allFetchedUsers.length} users cached`);
+      // Only a scan that started at the beginning represents a complete list.
+      if (!startingCursor) {
+        const cache: UserCacheData = {
+          users: allFetchedUsers,
+          timestamp: Date.now(),
+          workspace_id: this.requireWorkspaceId(),
+        };
+        this.userListCache = cache;
+        this.saveUserListCache(cache);
+        logger.info(`Full pagination complete: ${allFetchedUsers.length} users cached`);
+      }
 
       return {
         results: scoredResults.slice(0, limit),
         source: 'api',
         exhaustive: true,
+        scannedUsers: allFetchedUsers.length,
       };
-    } catch (error) {
-      logger.error('Failed to search users incrementally', error);
-      throw handleSlackError(error, 'search_users_incremental');
-    }
+    });
   }
 
   /**
@@ -956,75 +1267,17 @@ export class SlackClient {
    */
   getOrLoadUserListCache(): UserCacheData | null {
     if (this.userListCache) {
-      return this.userListCache;
+      const age = Date.now() - this.userListCache.timestamp;
+      if (Number.isFinite(age) && age >= 0 && age <= this.userCacheTtlMs) {
+        return this.userListCache;
+      }
+      this.userListCache = null;
     }
     const fileCache = this.loadUserListCache();
     if (fileCache) {
       this.userListCache = fileCache;
     }
     return this.userListCache;
-  }
-
-  /**
-   * Look up user ID by username or display name.
-   * Checks in-memory cache, then file cache, then does incremental API search.
-   */
-  async lookupUserByName(username: string): Promise<string | null> {
-    try {
-      const cleanUsername = username.replace(/^@/, '');
-      const searchTerm = cleanUsername.toLowerCase();
-
-      logger.info('Looking up user by name', { username: cleanUsername });
-
-      // 1. Check in-memory userCache (ID→display_name map)
-      for (const [id, displayName] of this.userCache.entries()) {
-        if (displayName.toLowerCase() === searchTerm) {
-          logger.info('Found user in memory cache', { userId: id });
-          return id;
-        }
-      }
-
-      // 2. Check file cache
-      const cached = this.getOrLoadUserListCache();
-      if (cached) {
-        const user = cached.users.find((u) => {
-          return u.name.toLowerCase() === searchTerm ||
-                 u.display_name.toLowerCase() === searchTerm ||
-                 u.real_name.toLowerCase() === searchTerm;
-        });
-        if (user) {
-          logger.info('Found user in file cache', { userId: user.id, name: user.name });
-          return user.id;
-        }
-        // Cache exists but user not found — trust the cache and return null.
-        // If the user was recently added to the workspace, call search_users first
-        // to refresh the cache, then retry.
-        logger.warn('User not found in cache', { username: cleanUsername });
-        return null;
-      }
-
-      // 3. Incremental API search with exact-match scoring (skip cache since we already checked)
-      const exactMatchScoreFn = (u: UserRecord): number => {
-        if (u.name.toLowerCase() === searchTerm ||
-            u.display_name.toLowerCase() === searchTerm ||
-            u.real_name.toLowerCase() === searchTerm) {
-          return 100;
-        }
-        return 0;
-      };
-
-      const result = await this.searchUsersIncremental(exactMatchScoreFn, 1, 100, true);
-      if (result.results.length > 0) {
-        logger.info('Found user via API search', { userId: result.results[0].id });
-        return result.results[0].id;
-      }
-
-      logger.warn('User not found', { username: cleanUsername });
-      return null;
-    } catch (error) {
-      logger.error('Failed to lookup user by name', error);
-      throw handleSlackError(error, 'lookup_user');
-    }
   }
 
   /**
@@ -1037,24 +1290,35 @@ export class SlackClient {
   /**
    * Populate user cache for a list of messages
    */
-  async populateUserCache(messages: SlackMessage[]): Promise<void> {
+  async populateUserCache(messages: Iterable<{ user?: string }>): Promise<void> {
     const userIds = new Set<string>();
-    
+
     for (const message of messages) {
       if (message.user && !this.userCache.has(message.user)) {
         userIds.add(message.user);
       }
     }
 
-    // Fetch user info in parallel for all uncached users
-    const promises = Array.from(userIds).map((userId) =>
-      this.resolveUsername(userId).catch(() => {
-        // Ignore errors, we'll just use user IDs
-        logger.debug(`Failed to fetch user info for ${userId}`);
-      })
+    // Bound concurrency so a 200-message fetch cannot fan out into 200 Slack
+    // requests at once. Individual lookup failures still fall back to user IDs.
+    const pendingUserIds = Array.from(userIds);
+    let nextIndex = 0;
+    const workers = Array.from(
+      { length: Math.min(this.userLookupConcurrency, pendingUserIds.length) },
+      async () => {
+        while (nextIndex < pendingUserIds.length) {
+          const userId = pendingUserIds[nextIndex];
+          nextIndex += 1;
+          await this.resolveUsername(userId).catch((error: unknown) => {
+            if (error instanceof AuthenticationError || error instanceof CancelledError) {
+              throw error;
+            }
+            logger.debug(`Failed to fetch user info for ${userId}`);
+          });
+        }
+      },
     );
-
-    await Promise.all(promises);
+    await Promise.all(workers);
   }
 
   /**
@@ -1068,7 +1332,7 @@ export class SlackClient {
     sort_dir?: 'asc' | 'desc';
     highlight?: boolean;
   }): Promise<SlackSearchMessagesResponse> {
-    try {
+    return this.withSlackError('search_messages', async () => {
       // Validate query parameter
       const trimmedQuery = params.query.trim();
       if (!trimmedQuery) {
@@ -1081,33 +1345,23 @@ export class SlackClient {
         page: params.page || 1,
       });
 
-      const response = await this.client.get<SlackSearchMessagesResponse>(
-        '/search.messages',
-        {
-          params: {
-            token: this.apiToken!,
-            query: trimmedQuery,
-            count: params.count || 20,
-            page: params.page || 1,
-            sort: params.sort || 'score',
-            sort_dir: params.sort_dir || 'desc',
-            highlight: params.highlight !== false,
-          },
-          headers: {
-            Cookie: `d=${this.cookieD}`,
-          },
-        }
+      const response = this.assertSlackOk(
+        await this.getSlackApi<SlackSearchMessagesResponse>('/search.messages', {
+          query: trimmedQuery,
+          count: params.count || 20,
+          page: params.page || 1,
+          sort: params.sort || 'score',
+          sort_dir: params.sort_dir || 'desc',
+          highlight: params.highlight !== false,
+        }),
+        'Failed to search messages',
       );
 
-      if (!response.data.ok) {
-        throw new Error(response.data.error || 'Failed to search messages');
-      }
+      logger.info(
+        `Found ${response.messages.matches.length} messages (${response.messages.total} total)`,
+      );
 
-      logger.info(`Found ${response.data.messages.matches.length} messages (${response.data.messages.total} total)`);
-
-      return response.data;
-    } catch (error) {
-      throw handleSlackError(error, 'search_messages');
-    }
+      return response;
+    });
   }
 }
