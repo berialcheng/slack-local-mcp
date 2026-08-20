@@ -1,5 +1,5 @@
 import type { SlackClient } from './slack-client.js';
-import { AuthenticationError } from './types.js';
+import { AuthenticationError, TimeoutError } from './types.js';
 
 export type SlackClientFactory = (signal: AbortSignal) => Promise<SlackClient>;
 
@@ -107,7 +107,7 @@ export class LazySlackClientProvider {
     const controller = new AbortController();
     const timeout = setTimeout(() => {
       controller.abort(
-        abortError(`Slack initialization exceeded ${this.initializationTimeoutMs}ms`),
+        new TimeoutError(`Slack initialization exceeded ${this.initializationTimeoutMs}ms`),
       );
     }, this.initializationTimeoutMs);
     timeout.unref();

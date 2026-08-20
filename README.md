@@ -200,7 +200,7 @@ This demonstrates **true workflow automation**—describe what you want, and let
 | `edit_message`           | Modify your messages                 | channel, timestamp, text       |
 | `delete_message`         | Remove messages                      | channel, timestamp             |
 | `fetch_channel_messages` | Get conversation history             | channel ID, limit              |
-| `fetch_thread_messages`  | Read thread replies                  | channel, thread_ts             |
+| `fetch_thread_messages`  | Read thread replies                  | channel, thread_ts, cursor     |
 | `search_messages`        | Search across workspace              | query, count, page, sort       |
 | `get_file_info`          | Get safe file metadata               | file                           |
 | `download_file`          | Download an eligible file to OS temp | file, allow_video, allow_other |
@@ -233,14 +233,22 @@ and creates no scheduled message.
 human-readable name. IDs and exact usernames can be sent immediately. A plain
 name such as `Cheng Zhong` is never resolved by silently taking the first match;
 the tool returns up to five readable candidates and sends nothing until one is
-selected.
+selected. A leading `@` is always treated as a username; canonical uppercase
+`U...`/`W...` values without `@` are treated as user IDs.
 
 Normal name searches inspect at most three `users.list` pages per call. An
 incomplete result includes `next_cursor`, which `search_users` can use to
 continue without restarting the scan. A cached miss also performs a bounded
 live check so newly joined users are not hidden by an older snapshot. Set
 `refresh_cache=true` only when an explicit complete cache rebuild is desired;
-large workspaces may require many paginated requests.
+large workspaces may require many paginated requests. Positive cache hits are
+intentionally served without another Slack request for up to one hour. Use a
+concrete user ID or refresh the cache when current directory state matters more
+than the zero-network fast path.
+
+`fetch_thread_messages` returns at most 200 messages per call. When more replies
+remain, the response includes `has_more=true` and `next_cursor`; pass that cursor
+back to continue without restarting the thread scan.
 
 ### 📁 File Metadata and Downloads
 
@@ -263,9 +271,19 @@ inspect one file. Use `download_file` to save it locally. The download policy is
 - Files are written atomically under the OS temp directory. On Windows this is
   `%TEMP%\slack-local-mcp`.
 - Completed MCP-owned downloads expire after seven days; abandoned `.part`
-  files expire after one hour. Cleanup runs only when a download is requested.
+  files expire after one hour. Cleanup is triggered by downloads, coalesced
+  across concurrent calls, and attempted at most once per hour per MCP process.
 - Downloads use authenticated HTTPS, at most five Slack-only redirects, response
-  type/size checks, and at most three attempts for transient network failures.
+  type/size checks, and at most three attempts for transient network failures or
+  direct-download rate limits. Idempotent Slack GET requests use the same bounded
+  transient retry; message writes are not retried automatically. Best-effort
+  `users.info` lookups used only for display names make one attempt, run at most
+  eight concurrently, and are capped at 32 previously unseen users per response.
+  Names already present in Slack search results are reused without another API
+  call, as are names from a complete directory already loaded by `search_users`.
+  Message formatting does not load the complete directory by itself. The
+  per-process display-name working set is capped at 1,000 entries; remaining or
+  unavailable names fall back to the user ID.
 
 The tools never open a browser or request an interactive login. On Windows, the
 tracked launcher can read the existing user environment configuration, making
@@ -343,11 +361,14 @@ Sort: timestamp (desc)
 - `LOG_LEVEL`: `debug`, `info`, `warn`, or `error` (default: `info`)
 - `SLACK_USER_CACHE_FILE`: User list cache path (default: a workspace-specific file under the OS temp `slack-local-mcp` directory)
 
-Complete user-list caches expire after one hour and are replaced atomically.
-Ordinary searches are bounded to three pages and return a continuation cursor;
+Complete user-list caches expire after one hour, use asynchronous disk I/O, and
+are replaced atomically. Ordinary searches are bounded to three pages and return
+a continuation cursor; successful pages do not incur a fixed delay, while real
+HTTP 429 responses still honor Slack's bounded `Retry-After` handling.
 `refresh_cache=true` is the explicit, potentially expensive full-rebuild path.
 A cache miss still checks Slack for newly joined users. Message formatting
-resolves at most eight previously unseen users concurrently.
+resolves at most 32 previously unseen users per response, with at most eight
+lookups running concurrently.
 
 ## Performance: TOON Format
 

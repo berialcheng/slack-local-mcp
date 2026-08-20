@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { LazySlackClientProvider } from '../build/lazy-slack-client.js';
-import { AuthenticationError } from '../build/types.js';
+import { AuthenticationError, TimeoutError } from '../build/types.js';
 
 function runnable(client) {
   return {
@@ -179,6 +179,11 @@ test('cancels a hanging initialization when its bounded timeout expires', async 
   };
   const provider = new LazySlackClientProvider(async () => client, 20);
 
-  await assert.rejects(provider.getClient(), /exceeded 20ms/);
+  await assert.rejects(provider.getClient(), (error) => {
+    assert.ok(error instanceof TimeoutError);
+    assert.equal(error.code, 'TIMEOUT');
+    assert.match(error.message, /exceeded 20ms/);
+    return true;
+  });
   assert.equal(internalSignal.aborted, true);
 });

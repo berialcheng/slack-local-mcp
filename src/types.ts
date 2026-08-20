@@ -120,6 +120,12 @@ export interface SlackConversationsRepliesResponse extends SlackApiResponse {
   };
 }
 
+export interface SlackMessagePage {
+  messages: SlackMessage[];
+  hasMore: boolean;
+  nextCursor?: string;
+}
+
 export interface SlackConversationsOpenResponse extends SlackApiResponse {
   channel: {
     id: string;
@@ -264,6 +270,7 @@ export interface FetchThreadMessagesInput {
   channel: string;
   thread_ts: string;
   limit?: number;
+  cursor?: string;
 }
 
 export interface AddReactionInput {
@@ -313,6 +320,8 @@ export interface ScheduleToolOutput {
 export interface FetchMessagesOutput {
   messages: FormattedMessage[];
   message_count: number;
+  has_more?: boolean;
+  next_cursor?: string;
 }
 
 export interface FormattedMessage {
@@ -486,5 +495,12 @@ export class CancelledError extends SlackError {
   constructor(message: string = 'Operation cancelled', details?: unknown) {
     super(message, 'CANCELLED', 499, details);
     this.name = 'CancelledError';
+  }
+}
+
+export class TimeoutError extends SlackError {
+  constructor(message: string, details?: unknown) {
+    super(message, 'TIMEOUT', 504, details);
+    this.name = 'TimeoutError';
   }
 }

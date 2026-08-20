@@ -12,6 +12,7 @@ import { ValidationError } from '../types.js';
 export const MAX_FILE_DOWNLOAD_BYTES = 20 * 1024 * 1024;
 export const COMPLETED_DOWNLOAD_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 export const PART_DOWNLOAD_RETENTION_MS = 60 * 60 * 1000;
+export const DOWNLOAD_DIRECTORY_CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
 
 export const FILE_DOWNLOAD_POLICY: FileDownloadPolicy = {
   max_bytes_exclusive: MAX_FILE_DOWNLOAD_BYTES,

@@ -199,7 +199,7 @@ test('retries transient file responses and stream resets without leaving partial
     url_private_download: hostedUrl,
   };
 
-  async function runScenario(name, firstResponse) {
+  async function runScenario(name, firstResponse, retryOptions) {
     let attempts = 0;
     axios.get = async () => {
       attempts += 1;
@@ -214,8 +214,10 @@ test('retries transient file responses and stream resets without leaving partial
     };
 
     const finalPath = path.join(directory, `${name}.png`);
-    const result = await client.withTransientRetry(name, () =>
-      client.downloadFileOnce(file, hostedUrl, finalPath, {}),
+    const result = await client.withTransientRetry(
+      name,
+      () => client.downloadFileOnce(file, hostedUrl, finalPath, {}),
+      retryOptions,
     );
     assert.equal(attempts, 2);
     assert.equal(result.bytes, 4);
@@ -228,6 +230,15 @@ test('retries transient file responses and stream resets without leaving partial
       headers: {},
       data: { destroy() {} },
     }));
+    await runScenario(
+      'http-429',
+      () => ({
+        status: 429,
+        headers: { 'retry-after': '0' },
+        data: { destroy() {} },
+      }),
+      { retryRateLimit: true },
+    );
     await runScenario('stream-reset', () => ({
       status: 200,
       headers: { 'content-type': 'image/png' },
@@ -239,7 +250,11 @@ test('retries transient file responses and stream resets without leaving partial
       })(),
     }));
 
-    assert.deepEqual((await fs.readdir(directory)).sort(), ['http-503.png', 'stream-reset.png']);
+    assert.deepEqual((await fs.readdir(directory)).sort(), [
+      'http-429.png',
+      'http-503.png',
+      'stream-reset.png',
+    ]);
   } finally {
     axios.get = originalGet;
     await fs.rm(directory, { recursive: true, force: true });
@@ -262,7 +277,7 @@ test('never downloads external files and sanitizes local filenames', () => {
   assert.equal(sanitizeDownloadFilename('.', '../fallback:name'), 'fallback_name');
 });
 
-test('retries transient network failures without duplicating interceptor rate-limit retries', async () => {
+test('retries transient failures only when the operation policy opts in', async () => {
   const client = new SlackClient({
     cookieD: `xoxd-${'x'.repeat(50)}`,
     workspaceUrl: 'https://example.slack.com',

@@ -146,17 +146,19 @@ export async function handleSendDirectMessage(
 
   const rawUserInput = input.user.trim();
   const userInput = normalizeUserId(rawUserInput);
+  const exactUsername = rawUserInput.startsWith('@');
 
   logger.info('Sending direct message', { user: userInput });
 
   // Determine if we have a user ID or username
   let actualUserId: string;
 
-  if (isUserId(userInput)) {
+  // A leading @ always means username. User IDs are accepted only in their
+  // canonical, unprefixed form so ordinary u*/w* usernames enter name search.
+  if (!exactUsername && isUserId(userInput)) {
     // Already a user ID
     actualUserId = userInput;
   } else {
-    const exactUsername = rawUserInput.startsWith('@');
     const searchTerm = userInput.toLowerCase();
     const candidateLimit = exactUsername ? 1 : RECIPIENT_CANDIDATE_LIMIT;
     const searchResult = await client.searchUsersIncremental(
@@ -185,6 +187,10 @@ export async function handleSendDirectMessage(
     // Slack usernames are unique. Human-readable names are not, so they always
     // require an explicit candidate selection unless the caller supplied an ID.
     if (exactUsername && candidates.length === 1) {
+      // Intentional performance trade-off: a valid full-user cache may be up
+      // to one hour old. We accept that bounded staleness instead of adding a
+      // users.info/users.list request to every @username DM. Use an explicit
+      // user ID when strict current identity is more important than zero-network lookup.
       actualUserId = candidates[0].id;
     } else {
       const status =

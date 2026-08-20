@@ -21,7 +21,9 @@ export function validateChannelId(id: string): boolean {
  * Valid formats: U... and W..., including legacy shorter IDs.
  */
 export function validateUserId(id: string): boolean {
-  return /^[UW][A-Z0-9]{8,}$/i.test(id);
+  // Slack IDs are canonically uppercase. Keeping this check case-sensitive
+  // prevents lowercase usernames such as `wendyzhong` from being treated as IDs.
+  return /^[UW][A-Z0-9]{8,}$/.test(id);
 }
 
 /**

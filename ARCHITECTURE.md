@@ -126,7 +126,7 @@ graph TB
 #### c. Fetch Tools (`fetch-tools.ts`)
 
 - **fetch_channel_messages**: Get recent messages from a channel
-- **fetch_thread_messages**: Get all messages from a specific thread
+- **fetch_thread_messages**: Get one page of messages from a specific thread
 
 **Input Parameters**:
 
@@ -135,6 +135,7 @@ graph TB
   channel: string;         // Channel ID
   limit?: number;          // Number of messages (default: 50, max: 200)
   thread_ts?: string;      // Thread timestamp for thread messages
+  cursor?: string;         // Opaque continuation cursor for thread messages
   oldest?: string;         // Oldest timestamp to include
   latest?: string;         // Latest timestamp to include
 }
@@ -156,6 +157,8 @@ graph TB
     }>;
   }>;
   message_count: number;
+  has_more?: boolean;
+  next_cursor?: string;
 }
 ```
 
@@ -235,9 +238,12 @@ File downloads use an exclusive 20 MiB limit. Images are enabled by default;
 videos and other files require explicit opt-in. External files remain
 metadata-only. Redirects are followed manually, limited to five hops, and must
 remain HTTPS URLs on Slack-owned hosts. Authentication and file downloads retry
-only transient failures, with a maximum of three attempts.
+only transient failures, with a maximum of three attempts. Idempotent Slack GET
+requests share that bounded retry, while message writes are not retried
+automatically. Direct file downloads may also honor HTTP 429 `Retry-After`.
 Completed MCP-owned temp downloads are retained for seven days and abandoned
-partial files for one hour; cleanup is lazy and runs only when downloading.
+partial files for one hour. Cleanup is lazy, coalesced across concurrent
+downloads, and attempted at most once per hour per MCP process.
 
 ### 3. Utilities (`src/utils/`)
 
@@ -464,15 +470,16 @@ selection; ordinary resolution scans at most three user-list pages.
 
 ### 8. fetch_thread_messages
 
-**Description**: Fetch all messages from a specific thread
+**Description**: Fetch one page of messages from a specific thread
 
 **Parameters**:
 
 - `channel` (string, required): Channel ID
 - `thread_ts` (string, required): Thread parent timestamp
 - `limit` (number, optional): Max messages (default: 100, max: 200)
+- `cursor` (string, optional): Opaque cursor returned by the previous page
 
-**Returns**: Array of thread replies with formatted text
+**Returns**: Thread replies with `has_more` and `next_cursor` when another page remains
 
 ---
 
@@ -569,16 +576,23 @@ cached miss falls through to a bounded live request so new users can be found.
 ### 3. Performance
 
 - Minimize API calls
-- Use a one-hour, workspace-specific, atomically replaced complete user cache
+- Use a one-hour, workspace-specific, asynchronously persisted complete user cache
+- Accept positive cache hits during that TTL as a zero-network performance trade-off
 - Bound ordinary user searches to three pages and expose continuation cursors
+- Continue successful user pages immediately; wait only when bounded HTTP 429 handling requires it
 - Treat cached misses as hints and perform a bounded live check for new users
-- Bound previously unseen user lookups to eight concurrent Slack requests
+- Reuse usernames embedded in search results before calling `users.info`
+- Reuse an already-loaded complete directory without loading it solely for message formatting
+- Bound previously unseen user lookups to eight concurrent and 32 total requests per response
+- Keep the per-process display-name working set bounded to 1,000 entries
 - Use pagination for large datasets
 - Async/await for all I/O operations
 
 ### 4. Reliability
 
-- Retry logic for transient failures
+- Bounded retry for idempotent reads; no automatic retry for message writes
+- Keep best-effort `users.info` display-name enrichment single-attempt
+- Distinct timeout and caller-cancellation errors
 - Graceful degradation
 - Comprehensive error logging
 - Clear error messages for users

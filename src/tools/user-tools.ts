@@ -75,34 +75,37 @@ export interface SearchUsersOutput {
 
 /**
  * Calculate Levenshtein distance between two strings
- * Used for fuzzy matching to handle typos
+ * Used for fuzzy matching to handle typos. The caller only cares about small
+ * distances, so skip impossible length gaps and keep one row instead of an
+ * O(m*n) matrix for every workspace user.
  */
-function levenshteinDistance(str1: string, str2: string): number {
-  const len1 = str1.length;
-  const len2 = str2.length;
-  const matrix: number[][] = [];
-
-  // Initialize matrix
-  for (let i = 0; i <= len1; i++) {
-    matrix[i] = [i];
-  }
-  for (let j = 0; j <= len2; j++) {
-    matrix[0][j] = j;
+function levenshteinDistance(str1: string, str2: string, maxDistance: number): number {
+  if (Math.abs(str1.length - str2.length) > maxDistance) {
+    return maxDistance + 1;
   }
 
-  // Fill matrix
-  for (let i = 1; i <= len1; i++) {
-    for (let j = 1; j <= len2; j++) {
-      const cost = str1[i - 1] === str2[j - 1] ? 0 : 1;
-      matrix[i][j] = Math.min(
-        matrix[i - 1][j] + 1, // deletion
-        matrix[i][j - 1] + 1, // insertion
-        matrix[i - 1][j - 1] + cost, // substitution
+  // The distance is symmetric; use the shorter value for the retained row.
+  const source = str1.length >= str2.length ? str1 : str2;
+  const target = str1.length >= str2.length ? str2 : str1;
+  const distances = Array.from({ length: target.length + 1 }, (_, index) => index);
+
+  for (let sourceIndex = 1; sourceIndex <= source.length; sourceIndex += 1) {
+    let diagonal = distances[0];
+    distances[0] = sourceIndex;
+
+    for (let targetIndex = 1; targetIndex <= target.length; targetIndex += 1) {
+      const above = distances[targetIndex];
+      const substitutionCost = source[sourceIndex - 1] === target[targetIndex - 1] ? 0 : 1;
+      distances[targetIndex] = Math.min(
+        above + 1,
+        distances[targetIndex - 1] + 1,
+        diagonal + substitutionCost,
       );
+      diagonal = above;
     }
   }
 
-  return matrix[len1][len2];
+  return distances[target.length];
 }
 
 /**
@@ -113,15 +116,14 @@ function similarityScore(query: string, target: string): number {
   if (query === target) return 100;
   if (target.includes(query)) return 60;
 
-  const distance = levenshteinDistance(query, target);
-
   // Allow up to 2 character differences for strings > 4 chars
   // or 1 difference for shorter strings
   const threshold = query.length > 4 ? 2 : 1;
+  const distance = levenshteinDistance(query, target, threshold);
 
   if (distance <= threshold) {
     // Return score based on how close the match is
-    return 50 - distance * 10; // 50 for 1 char diff, 40 for 2 char diff
+    return 60 - distance * 10; // 50 for 1 char diff, 40 for 2 char diff
   }
 
   return 0;
@@ -133,6 +135,7 @@ function similarityScore(query: string, target: string): number {
  */
 export function createUserScoreFn(cleanQuery: string): (user: UserRecord) => number {
   const normalizedQuery = cleanQuery.replace(/[.\-_]/g, '');
+  const hasNormalizedQuery = normalizedQuery.length > 0;
 
   return (user: UserRecord): number => {
     const name = user.name.toLowerCase();
@@ -145,7 +148,7 @@ export function createUserScoreFn(cleanQuery: string): (user: UserRecord) => num
       return 100;
     }
     // Normalized exact match (ignoring dots, hyphens, underscores)
-    if (normalizedName === normalizedQuery) {
+    if (hasNormalizedQuery && normalizedName === normalizedQuery) {
       return 95;
     }
     // Starts with query (exact or normalized)
@@ -156,7 +159,7 @@ export function createUserScoreFn(cleanQuery: string): (user: UserRecord) => num
     ) {
       return 80;
     }
-    if (normalizedName.startsWith(normalizedQuery)) {
+    if (hasNormalizedQuery && normalizedName.startsWith(normalizedQuery)) {
       return 75;
     }
     // Word boundary match in real name
@@ -171,7 +174,7 @@ export function createUserScoreFn(cleanQuery: string): (user: UserRecord) => num
     ) {
       return 60;
     }
-    if (normalizedName.includes(normalizedQuery)) {
+    if (hasNormalizedQuery && normalizedName.includes(normalizedQuery)) {
       return 55;
     }
     // Fuzzy matching for typos
@@ -202,6 +205,9 @@ export async function handleSearchUsers(
 
   // Strip common email/domain suffixes
   cleanQuery = cleanQuery.replace(/[-@][a-z0-9-]+\.(com|net|org|io|dev)$/i, '');
+  if (!cleanQuery) {
+    return 'Search query cannot be empty.';
+  }
 
   const limit = input.limit || 5;
 

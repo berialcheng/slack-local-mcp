@@ -2,7 +2,6 @@
  * Slack API Client with cookie-based authentication
  */
 
-import * as fs from 'fs';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash, randomUUID } from 'node:crypto';
 import { promises as fsPromises } from 'node:fs';
@@ -10,7 +9,7 @@ import * as os from 'node:os';
 import * as path from 'path';
 
 import axios from 'axios';
-import type { AxiosInstance, AxiosError } from 'axios';
+import type { AxiosInstance } from 'axios';
 
 import type {
   SlackApiResponse,
@@ -25,6 +24,7 @@ import type {
   SlackUsersInfoResponse,
   SlackUsersListResponse,
   SlackMessage,
+  SlackMessagePage,
   SlackUser,
   SlackSearchMessagesResponse,
   SlackFile,
@@ -37,6 +37,7 @@ import {
   assertAllowedSlackDownloadUrl,
   classifySlackFile,
   cleanupSlackDownloadDirectory,
+  DOWNLOAD_DIRECTORY_CLEANUP_INTERVAL_MS,
   getFileCategorySkipReason,
   MAX_FILE_DOWNLOAD_BYTES,
   normalizeSlackFileId,
@@ -57,6 +58,8 @@ export type UserRecord = {
   real_name: string;
 };
 
+type ScoredUserRecord = UserRecord & { score: number };
+
 interface UserCacheData {
   users: UserRecord[];
   timestamp: number;
@@ -71,8 +74,55 @@ interface SlackDownloadStream {
   finalUrl: URL;
 }
 
+interface TransientRetryOptions {
+  retryRateLimit?: boolean;
+  maxAttempts?: number;
+}
+
+const TRANSIENT_NETWORK_CODES = new Set([
+  'ECONNRESET',
+  'ECONNREFUSED',
+  'ECONNABORTED',
+  'EPIPE',
+  'ETIMEDOUT',
+  'EAI_AGAIN',
+  'EHOSTUNREACH',
+  'ENETDOWN',
+  'ENETUNREACH',
+  'ERR_STREAM_PREMATURE_CLOSE',
+]);
+
+const TRANSIENT_HTTP_STATUSES = new Set([502, 503, 504]);
+
+function insertTopScoredUser(
+  results: ScoredUserRecord[],
+  user: UserRecord,
+  score: number,
+  limit: number,
+): void {
+  if (!Number.isFinite(score) || score <= 0 || limit <= 0) return;
+
+  // Binary insertion keeps only the requested top results. Equal scores stay
+  // in workspace order, matching stable Array.sort behavior without creating
+  // a scored copy of every cached user.
+  let low = 0;
+  let high = results.length;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (results[middle].score >= score) {
+      low = middle + 1;
+    } else {
+      high = middle;
+    }
+  }
+  if (low >= limit) return;
+
+  results.splice(low, 0, { ...user, score });
+  if (results.length > limit) results.pop();
+}
+
 export interface SearchUsersIncrementalResult {
-  results: Array<UserRecord & { score: number }>;
+  results: ScoredUserRecord[];
   source: 'cache' | 'api';
   exhaustive: boolean;
   scannedUsers: number;
@@ -106,7 +156,10 @@ export class SlackClient {
   private readonly requestSignal = new AsyncLocalStorage<AbortSignal>();
   private readonly userCacheTtlMs = 60 * 60 * 1000;
   private readonly userLookupConcurrency = 8;
+  private readonly maxUserEnrichmentLookups = 32;
+  private readonly maxCachedUsernames = 1000;
   private downloadDirectoryCleanup: Promise<void> | undefined;
+  private lastDownloadDirectoryCleanupAt = 0;
 
   constructor(config: SlackClientConfig) {
     // Validate cookie
@@ -163,40 +216,15 @@ export class SlackClient {
       },
     );
 
-    // Add response interceptor for logging and error handling
-    this.client.interceptors.response.use(
-      (response) => {
-        logger.debug(`API Response: ${response.config.url}`, {
-          status: response.status,
-          ok: response.data?.ok,
-        });
-        return response;
-      },
-      async (error: AxiosError) => {
-        const retryConfig = error.config as
-          (NonNullable<AxiosError['config']> & { slackRateLimitRetried?: boolean }) | undefined;
-
-        // Retry a rate-limited API request once. Higher-level file operations
-        // also have their own bounded retry budget.
-        if (error.response?.status === 429 && retryConfig && !retryConfig.slackRateLimitRetried) {
-          retryConfig.slackRateLimitRetried = true;
-          const retryAfter = error.response.headers['retry-after'];
-          const parsedRetryAfter = retryAfter
-            ? parseInt(String(retryAfter), 10) * 1000
-            : this.retryDelay;
-          const delay = Number.isFinite(parsedRetryAfter)
-            ? Math.min(parsedRetryAfter, 30_000)
-            : this.retryDelay;
-
-          logger.warn(`Rate limited, retrying after ${delay}ms`);
-
-          await this.sleep(delay);
-          // Retry the request once
-          return this.client.request(retryConfig);
-        }
-        return Promise.reject(error);
-      },
-    );
+    // Keep transport interception observational only. Retry policy belongs to
+    // the explicit operation wrappers below so POST writes are never replayed.
+    this.client.interceptors.response.use((response) => {
+      logger.debug(`API Response: ${response.config.url}`, {
+        status: response.status,
+        ok: response.data?.ok,
+      });
+      return response;
+    });
   }
 
   /**
@@ -243,27 +271,20 @@ export class SlackClient {
     return this.requestSignal.run(signal, action);
   }
 
-  private isTransientNetworkError(error: unknown): boolean {
+  private isTransientNetworkError(
+    error: unknown,
+    { retryRateLimit = false }: TransientRetryOptions = {},
+  ): boolean {
     if (!error || typeof error !== 'object') return false;
     const candidate = error as {
       code?: string;
       response?: { status?: number };
     };
-    const transientCodes = new Set([
-      'ECONNRESET',
-      'ECONNREFUSED',
-      'ECONNABORTED',
-      'EPIPE',
-      'ETIMEDOUT',
-      'EAI_AGAIN',
-      'EHOSTUNREACH',
-      'ENETDOWN',
-      'ENETUNREACH',
-      'ERR_STREAM_PREMATURE_CLOSE',
-    ]);
+    const status = candidate.response?.status || 0;
     return (
-      (candidate.code ? transientCodes.has(candidate.code) : false) ||
-      [502, 503, 504].includes(candidate.response?.status || 0)
+      (candidate.code ? TRANSIENT_NETWORK_CODES.has(candidate.code) : false) ||
+      TRANSIENT_HTTP_STATUSES.has(status) ||
+      (retryRateLimit && status === 429)
     );
   }
 
@@ -284,20 +305,25 @@ export class SlackClient {
     return this.retryDelay * attempt;
   }
 
-  private async withTransientRetry<T>(operation: string, action: () => Promise<T>): Promise<T> {
+  private async withTransientRetry<T>(
+    operation: string,
+    action: () => Promise<T>,
+    options: TransientRetryOptions = {},
+  ): Promise<T> {
+    const maxAttempts = options.maxAttempts ?? this.maxTransientAttempts;
     let lastError: unknown;
-    for (let attempt = 1; attempt <= this.maxTransientAttempts; attempt += 1) {
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       try {
         return await action();
       } catch (error) {
         lastError = error;
-        if (!this.isTransientNetworkError(error) || attempt === this.maxTransientAttempts) {
+        if (!this.isTransientNetworkError(error, options) || attempt === maxAttempts) {
           throw error;
         }
         const delay = this.getRetryDelay(error, attempt);
         logger.warn(`${operation} hit a transient network error; retrying`, {
           attempt,
-          max_attempts: this.maxTransientAttempts,
+          max_attempts: maxAttempts,
           delay_ms: delay,
           code: (error as { code?: string }).code,
         });
@@ -350,12 +376,21 @@ export class SlackClient {
   private async getSlackApi<T extends SlackApiResponse>(
     endpoint: string,
     fields: Record<string, SlackApiField> = {},
+    retryOptions: TransientRetryOptions = {},
   ): Promise<T> {
-    const response = await this.client.get<T>(endpoint, {
-      params: this.createAuthenticatedParams(fields),
-      headers: this.getCookieHeaders(),
-    });
-    return response.data;
+    // Primary GET operations are idempotent and own one bounded retry budget,
+    // including HTTP 429. Callers may lower that budget for optional enrichment.
+    return this.withTransientRetry(
+      `Slack GET ${endpoint}`,
+      async () => {
+        const response = await this.client.get<T>(endpoint, {
+          params: this.createAuthenticatedParams(fields),
+          headers: this.getCookieHeaders(),
+        });
+        return response.data;
+      },
+      { retryRateLimit: true, ...retryOptions },
+    );
   }
 
   private async postSlackApi<T extends SlackApiResponse>(
@@ -390,8 +425,10 @@ export class SlackClient {
     return this.withSlackError('fetch_api_token', async () => {
       logger.debug('Fetching API token from workspace...');
 
-      const response = await this.withTransientRetry('Slack token fetch', () =>
-        this.fetchWorkspaceHtml(workspaceUrl),
+      const response = await this.withTransientRetry(
+        'Slack token fetch',
+        () => this.fetchWorkspaceHtml(workspaceUrl),
+        { retryRateLimit: true },
       );
 
       // Extract api_token from the response HTML
@@ -489,8 +526,12 @@ export class SlackClient {
         this.apiToken = await this.fetchApiToken(workspaceUrl);
         this.workspaceUrl = workspaceUrl;
 
-        const response = await this.withTransientRetry('Slack authentication', () =>
-          this.postSlackApi<SlackAuthTestResponse>('/auth.test', {}),
+        const response = await this.withTransientRetry(
+          'Slack authentication',
+          () => this.postSlackApi<SlackAuthTestResponse>('/auth.test', {}),
+          // auth.test is a non-mutating read despite using POST, so a bounded
+          // HTTP 429 retry is safe. Message-writing POST calls remain unwrapped.
+          { retryRateLimit: true },
         );
 
         if (!response.ok) {
@@ -706,7 +747,8 @@ export class SlackClient {
     channel: string;
     thread_ts: string;
     limit?: number;
-  }): Promise<SlackMessage[]> {
+    cursor?: string;
+  }): Promise<SlackMessagePage> {
     return this.withSlackError('fetch_thread_replies', async () => {
       logger.info('Fetching thread replies', {
         channel: params.channel,
@@ -718,13 +760,19 @@ export class SlackClient {
           channel: params.channel,
           ts: params.thread_ts,
           limit: params.limit || 100,
+          cursor: params.cursor,
         }),
         'Failed to fetch thread replies',
       );
 
       logger.info(`Fetched ${response.messages.length} thread replies`);
 
-      return response.messages;
+      const nextCursor = response.response_metadata?.next_cursor || undefined;
+      return {
+        messages: response.messages,
+        hasMore: Boolean(response.has_more || nextCursor),
+        nextCursor,
+      };
     });
   }
 
@@ -734,9 +782,9 @@ export class SlackClient {
   async getFileInfo(fileId: string): Promise<SlackFile> {
     return this.withSlackError('get_file_info', async () => {
       logger.info('Fetching Slack file metadata', { file_id: fileId });
-      const response = await this.withTransientRetry('Slack files.info', () =>
-        this.getSlackApi<SlackFilesInfoResponse>('/files.info', { file: fileId }),
-      );
+      const response = await this.getSlackApi<SlackFilesInfoResponse>('/files.info', {
+        file: fileId,
+      });
 
       this.assertSlackOk(response, 'Failed to fetch file information');
       if (!response.file) {
@@ -848,7 +896,9 @@ export class SlackClient {
       let bytes = 0;
 
       for await (const chunk of stream) {
-        const buffer = Buffer.from(chunk);
+        // Axios' Node stream normally yields Buffer instances. Reuse them
+        // instead of copying every download chunk into a second allocation.
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
         bytes += buffer.length;
         if (bytes >= MAX_FILE_DOWNLOAD_BYTES) {
           throw new ValidationError('Downloaded content reached the 20 MiB limit');
@@ -870,7 +920,8 @@ export class SlackClient {
         );
       }
 
-      await handle.sync();
+      // This is a TEMP artifact, so closing before the atomic rename is enough;
+      // forcing a physical disk flush would add latency to every small image.
       await handle.close();
       handle = undefined;
       await fsPromises.rename(temporaryPath, finalPath);
@@ -891,6 +942,35 @@ export class SlackClient {
       await fsPromises.unlink(temporaryPath).catch(() => undefined);
       throw error;
     }
+  }
+
+  private async cleanupDownloadDirectoryIfDue(
+    outputDirectory: string,
+    now: number = Date.now(),
+  ): Promise<void> {
+    if (this.downloadDirectoryCleanup) {
+      await this.downloadDirectoryCleanup;
+      return;
+    }
+    if (now - this.lastDownloadDirectoryCleanupAt < DOWNLOAD_DIRECTORY_CLEANUP_INTERVAL_MS) {
+      return;
+    }
+
+    // Record attempts, not just successes: a temporary cleanup failure should
+    // not make every subsequent download retry filesystem work immediately.
+    this.lastDownloadDirectoryCleanupAt = now;
+    const cleanup = cleanupSlackDownloadDirectory(outputDirectory, now)
+      .then((removed) => {
+        if (removed > 0) logger.info(`Removed ${removed} expired Slack temp file(s)`);
+      })
+      .catch((error: unknown) => {
+        logger.warn('Failed to clean expired Slack temp files', error);
+      })
+      .finally(() => {
+        this.downloadDirectoryCleanup = undefined;
+      });
+    this.downloadDirectoryCleanup = cleanup;
+    await cleanup;
   }
 
   /**
@@ -921,22 +1001,17 @@ export class SlackClient {
       const safeFileId = normalizeSlackFileId(file.id);
       const outputDirectory = path.join(os.tmpdir(), 'slack-local-mcp');
       await fsPromises.mkdir(outputDirectory, { recursive: true, mode: 0o700 });
-      this.downloadDirectoryCleanup ??= cleanupSlackDownloadDirectory(outputDirectory)
-        .then((removed) => {
-          if (removed > 0) logger.info(`Removed ${removed} expired Slack temp file(s)`);
-        })
-        .catch((error: unknown) => {
-          logger.warn('Failed to clean expired Slack temp files', error);
-        });
-      await this.downloadDirectoryCleanup;
+      await this.cleanupDownloadDirectoryIfDue(outputDirectory);
       const filename = sanitizeDownloadFilename(file.name || file.title || safeFileId, safeFileId);
       const finalPath = path.join(
         outputDirectory,
         `${safeFileId}-${Date.now()}-${randomUUID().slice(0, 8)}-${filename}`,
       );
 
-      return await this.withTransientRetry('Slack file download', () =>
-        this.downloadFileOnce(file, privateUrl, finalPath, options),
+      return await this.withTransientRetry(
+        'Slack file download',
+        () => this.downloadFileOnce(file, privateUrl, finalPath, options),
+        { retryRateLimit: true },
       );
     });
   }
@@ -991,20 +1066,59 @@ export class SlackClient {
     });
   }
 
+  private cacheUsername(userId: string, displayName: string): void {
+    const normalizedName = displayName.trim();
+    if (!normalizedName) return;
+
+    // Keep a small insertion-ordered working set rather than retaining an
+    // entire large workspace directory in every long-lived MCP process.
+    this.userCache.delete(userId);
+    this.userCache.set(userId, normalizedName);
+    if (this.userCache.size > this.maxCachedUsernames) {
+      const oldestUserId = this.userCache.keys().next().value;
+      if (oldestUserId !== undefined) {
+        this.userCache.delete(oldestUserId);
+      }
+    }
+  }
+
+  private getCachedUsername(userId: string): string | undefined {
+    const displayName = this.userCache.get(userId);
+    if (displayName !== undefined) {
+      // Refresh recently used message authors before optional enrichment can
+      // evict older entries from the bounded cache.
+      this.userCache.delete(userId);
+      this.userCache.set(userId, displayName);
+    }
+    return displayName;
+  }
+
+  private cacheUserRecords(users: Iterable<UserRecord>): void {
+    for (const user of users) {
+      this.cacheUsername(user.id, user.display_name || user.real_name || user.name);
+    }
+  }
+
   /**
    * Get user information and cache it
    */
   async getUserInfo(userId: string): Promise<SlackUser> {
     return this.withSlackError('get_user_info', async () => {
       const response = this.assertSlackOk(
-        await this.getSlackApi<SlackUsersInfoResponse>('/users.info', { user: userId }),
+        await this.getSlackApi<SlackUsersInfoResponse>(
+          '/users.info',
+          { user: userId },
+          // Name enrichment is best-effort. One failed lookup should fall back
+          // to the user ID instead of multiplying optional network requests.
+          { retryRateLimit: false, maxAttempts: 1 },
+        ),
         'Failed to get user info',
       );
 
       // Cache the user's display name
       const displayName =
         response.user.profile.display_name || response.user.real_name || response.user.name;
-      this.userCache.set(userId, displayName);
+      this.cacheUsername(userId, displayName);
 
       return response.user;
     });
@@ -1014,7 +1128,7 @@ export class SlackClient {
    * Get cached username or fetch if not cached
    */
   async resolveUsername(userId: string): Promise<string> {
-    const cachedName = this.userCache.get(userId);
+    const cachedName = this.getCachedUsername(userId);
     if (cachedName !== undefined) {
       return cachedName;
     }
@@ -1034,13 +1148,9 @@ export class SlackClient {
   /**
    * Load user list cache from file
    */
-  private loadUserListCache(): UserCacheData | null {
+  private async loadUserListCache(): Promise<UserCacheData | null> {
     try {
-      if (!fs.existsSync(this.userCacheFile)) {
-        return null;
-      }
-
-      const data = fs.readFileSync(this.userCacheFile, 'utf-8');
+      const data = await fsPromises.readFile(this.userCacheFile, 'utf-8');
       const cache: UserCacheData = JSON.parse(data);
 
       // Check if cache is for the same workspace
@@ -1076,7 +1186,9 @@ export class SlackClient {
 
       return cache;
     } catch (error) {
-      logger.warn('Failed to load user list cache', error);
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        logger.warn('Failed to load user list cache', error);
+      }
       return null;
     }
   }
@@ -1084,22 +1196,20 @@ export class SlackClient {
   /**
    * Save user list cache to file
    */
-  private saveUserListCache(cache: UserCacheData): void {
+  private async saveUserListCache(cache: UserCacheData): Promise<void> {
     let temporaryFile: string | undefined;
     try {
       // Ensure directory exists
       const dir = path.dirname(this.userCacheFile);
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-      }
+      await fsPromises.mkdir(dir, { recursive: true, mode: 0o700 });
 
       temporaryFile = `${this.userCacheFile}.${process.pid}.${randomUUID()}.tmp`;
-      fs.writeFileSync(temporaryFile, JSON.stringify(cache, null, 2), {
+      await fsPromises.writeFile(temporaryFile, JSON.stringify(cache), {
         encoding: 'utf-8',
         mode: 0o600,
         flag: 'wx',
       });
-      fs.renameSync(temporaryFile, this.userCacheFile);
+      await fsPromises.rename(temporaryFile, this.userCacheFile);
       temporaryFile = undefined;
       logger.debug('Saved user list cache to file', {
         users: cache.users.length,
@@ -1109,11 +1219,8 @@ export class SlackClient {
       logger.warn('Failed to save user list cache', error);
     } finally {
       if (temporaryFile) {
-        try {
-          fs.unlinkSync(temporaryFile);
-        } catch {
-          // Best-effort cleanup after a concurrent writer or interrupted rename.
-        }
+        // Best-effort cleanup after a concurrent writer or interrupted rename.
+        await fsPromises.unlink(temporaryFile).catch(() => undefined);
       }
     }
   }
@@ -1135,16 +1242,19 @@ export class SlackClient {
       : Math.max(1, Math.floor(options.maxPages ?? Number.POSITIVE_INFINITY));
     const startingCursor = options.cursor?.trim() || undefined;
 
-    // Phase 1: Try cache first (zero API calls)
+    // Phase 1: Try cache first (zero Slack API calls; disk access is async)
     if (!options.skipCache && !startingCursor) {
-      const cached = this.getOrLoadUserListCache();
+      const cached = await this.getOrLoadUserListCache();
       if (cached) {
-        const scored = cached.users
-          .map((u) => ({ ...u, score: scoreFn(u) }))
-          .filter((s) => s.score > 0)
-          .sort((a, b) => b.score - a.score)
-          .slice(0, limit);
+        const scored: ScoredUserRecord[] = [];
+        for (const user of cached.users) {
+          insertTopScoredUser(scored, user, scoreFn(user), limit);
+        }
         if (scored.length > 0) {
+          // Intentional bounded-staleness trade-off: positive hits remain
+          // zero-network for the one-hour TTL. Callers can explicitly skip or
+          // refresh the cache when a current directory matters more.
+          this.cacheUserRecords(scored);
           return {
             results: scored,
             source: 'cache',
@@ -1162,7 +1272,7 @@ export class SlackClient {
     return this.withSlackError('search_users_incremental', async () => {
       logger.info('Searching users via incremental API pagination');
       const allFetchedUsers: UserRecord[] = [];
-      const scoredResults: Array<UserRecord & { score: number }> = [];
+      const scoredResults: ScoredUserRecord[] = [];
       let cursor: string | undefined = startingCursor;
       let pagesFetched = 0;
       const pageSize = 100;
@@ -1176,44 +1286,34 @@ export class SlackClient {
           'Failed to list users',
         );
 
-        const pageUsers: UserRecord[] = (response.members || [])
-          .filter((u: SlackUser) => !u.deleted && !u.is_bot)
-          .map((u: SlackUser) => ({
-            id: u.id,
-            name: u.name,
-            display_name: u.profile.display_name || '',
-            real_name: u.real_name || '',
-          }));
-
-        allFetchedUsers.push(...pageUsers);
         pagesFetched += 1;
 
-        // Side effect: populate in-memory userCache for resolveUsername
-        for (const u of pageUsers) {
-          this.userCache.set(u.id, u.display_name || u.real_name || u.name);
+        // Build the persistent directory snapshot while retaining only the
+        // best requested matches in the separate in-memory display-name cache.
+        for (const user of response.members || []) {
+          if (user.deleted || user.is_bot) continue;
+          const record: UserRecord = {
+            id: user.id,
+            name: user.name,
+            display_name: user.profile.display_name || '',
+            real_name: user.real_name || '',
+          };
+          allFetchedUsers.push(record);
+          insertTopScoredUser(scoredResults, record, scoreFn(record), limit);
         }
-
-        // Score this page
-        for (const u of pageUsers) {
-          const score = scoreFn(u);
-          if (score > 0) {
-            scoredResults.push({ ...u, score });
-          }
-        }
-        // Keep sorted
-        scoredResults.sort((a, b) => b.score - a.score);
 
         logger.debug(
-          `Paginated ${allFetchedUsers.length} users so far, ${scoredResults.length} matches`,
+          `Paginated ${allFetchedUsers.length} users so far, retained ${scoredResults.length} top matches`,
         );
 
         cursor = response.response_metadata?.next_cursor || undefined;
 
         // Early termination: enough high-confidence matches AND more pages remain
         if (!forceFullScan && cursor && scoredResults.length >= limit) {
-          const topN = scoredResults.slice(0, limit);
+          const topN = scoredResults;
           if (topN.every((r) => r.score >= earlyStopThreshold)) {
             logger.info(`Early stop: found ${limit} matches scoring >= ${earlyStopThreshold}`);
+            this.cacheUserRecords(topN);
             return {
               results: topN,
               source: 'api',
@@ -1226,8 +1326,9 @@ export class SlackClient {
 
         if (!forceFullScan && cursor && pagesFetched >= maxPages) {
           logger.info(`User search paused after ${pagesFetched} page(s)`);
+          this.cacheUserRecords(scoredResults);
           return {
-            results: scoredResults.slice(0, limit),
+            results: scoredResults,
             source: 'api',
             exhaustive: false,
             scannedUsers: allFetchedUsers.length,
@@ -1235,9 +1336,8 @@ export class SlackClient {
           };
         }
 
-        if (cursor) {
-          await this.sleep(1000);
-        }
+        // Do not add an unconditional inter-page delay. The shared idempotent
+        // GET policy already honors HTTP 429 Retry-After with a bounded retry.
       } while (cursor);
 
       // Only a scan that started at the beginning represents a complete list.
@@ -1248,12 +1348,13 @@ export class SlackClient {
           workspace_id: this.requireWorkspaceId(),
         };
         this.userListCache = cache;
-        this.saveUserListCache(cache);
+        await this.saveUserListCache(cache);
         logger.info(`Full pagination complete: ${allFetchedUsers.length} users cached`);
       }
 
+      this.cacheUserRecords(scoredResults);
       return {
-        results: scoredResults.slice(0, limit),
+        results: scoredResults,
         source: 'api',
         exhaustive: true,
         scannedUsers: allFetchedUsers.length,
@@ -1262,18 +1363,28 @@ export class SlackClient {
   }
 
   /**
-   * Get user list from cache only (memory or file). Never triggers API calls.
+   * Return a complete directory only when it is already loaded and still fresh.
+   */
+  private getFreshInMemoryUserListCache(): UserCacheData | null {
+    if (!this.userListCache) return null;
+
+    const age = Date.now() - this.userListCache.timestamp;
+    if (Number.isFinite(age) && age >= 0 && age <= this.userCacheTtlMs) {
+      return this.userListCache;
+    }
+    this.userListCache = null;
+    return null;
+  }
+
+  /**
+   * Get user list from cache only (memory or async file I/O). Never triggers API calls.
    * Returns null if no cache is available.
    */
-  getOrLoadUserListCache(): UserCacheData | null {
-    if (this.userListCache) {
-      const age = Date.now() - this.userListCache.timestamp;
-      if (Number.isFinite(age) && age >= 0 && age <= this.userCacheTtlMs) {
-        return this.userListCache;
-      }
-      this.userListCache = null;
-    }
-    const fileCache = this.loadUserListCache();
+  async getOrLoadUserListCache(): Promise<UserCacheData | null> {
+    const memoryCache = this.getFreshInMemoryUserListCache();
+    if (memoryCache) return memoryCache;
+
+    const fileCache = await this.loadUserListCache();
     if (fileCache) {
       this.userListCache = fileCache;
     }
@@ -1290,18 +1401,51 @@ export class SlackClient {
   /**
    * Populate user cache for a list of messages
    */
-  async populateUserCache(messages: Iterable<{ user?: string }>): Promise<void> {
+  async populateUserCache(messages: Iterable<{ user?: string; username?: string }>): Promise<void> {
     const userIds = new Set<string>();
 
     for (const message of messages) {
-      if (message.user && !this.userCache.has(message.user)) {
-        userIds.add(message.user);
+      if (!message.user) continue;
+      if (this.getCachedUsername(message.user) !== undefined) {
+        userIds.delete(message.user);
+        continue;
+      }
+
+      // search.messages normally supplies a usable username already. Prefer
+      // that response hint over an optional users.info round trip.
+      const usernameHint = message.username?.trim();
+      if (usernameHint) {
+        userIds.delete(message.user);
+        this.cacheUsername(message.user, usernameHint);
+        continue;
+      }
+      userIds.add(message.user);
+    }
+
+    // Reuse a complete directory only when another user-search operation has
+    // already loaded it. Do not pull a potentially large file into memory just
+    // to decorate one message response.
+    const directoryCache = this.getFreshInMemoryUserListCache();
+    if (directoryCache && userIds.size > 0) {
+      for (const user of directoryCache.users) {
+        if (!userIds.has(user.id)) continue;
+        this.cacheUsername(user.id, user.display_name || user.real_name || user.name);
+        userIds.delete(user.id);
+        if (userIds.size === 0) break;
       }
     }
 
-    // Bound concurrency so a 200-message fetch cannot fan out into 200 Slack
-    // requests at once. Individual lookup failures still fall back to user IDs.
-    const pendingUserIds = Array.from(userIds);
+    // Name enrichment is optional: bound both its concurrency and total work.
+    // Four waves of eight lookups keep common authors readable without making a
+    // large message page wait for every previously unseen user.
+    const pendingUserIds = Array.from(userIds).slice(0, this.maxUserEnrichmentLookups);
+    const omittedUserIds = userIds.size - pendingUserIds.length;
+    if (omittedUserIds > 0) {
+      logger.debug('Skipped optional user-name enrichment beyond the per-response limit', {
+        limit: this.maxUserEnrichmentLookups,
+        omitted_users: omittedUserIds,
+      });
+    }
     let nextIndex = 0;
     const workers = Array.from(
       { length: Math.min(this.userLookupConcurrency, pendingUserIds.length) },

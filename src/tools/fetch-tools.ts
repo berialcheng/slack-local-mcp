@@ -106,12 +106,12 @@ export async function handleFetchChannelMessages(
 
 /**
  * Tool: fetch_thread_messages
- * Fetch all messages from a specific thread
+ * Fetch one page of messages from a specific thread
  */
 export const fetchThreadMessagesTool = {
   name: 'fetch_thread_messages',
   description:
-    'Fetch all messages from a specific conversation thread in a channel. Returns the parent message and all replies in chronological order, formatted for AI analysis. Use this to understand thread discussions or summarize threaded conversations.',
+    'Fetch one page of messages from a specific conversation thread, formatted for AI analysis. Returns has_more and next_cursor when additional replies remain.',
   inputSchema: z.object({
     channel: conversationIdSchema.describe(
       'Conversation ID where the thread exists (e.g., C12345678)',
@@ -127,6 +127,13 @@ export const fetchThreadMessagesTool = {
       .optional()
       .default(100)
       .describe('Maximum number of messages to fetch (default: 100, max: 200)'),
+    cursor: z
+      .string()
+      .trim()
+      .min(1)
+      .max(1000)
+      .optional()
+      .describe('Opaque next_cursor returned by a previous fetch_thread_messages call'),
   }),
 };
 
@@ -144,16 +151,19 @@ export async function handleFetchThreadMessages(
     channel,
     thread_ts: input.thread_ts,
     limit,
+    hasCursor: Boolean(input.cursor),
   });
 
   // Fetch thread replies
-  const messages = await client.fetchThreadReplies({
+  const page = await client.fetchThreadReplies({
     channel,
     thread_ts: input.thread_ts,
     limit,
+    cursor: input.cursor,
   });
+  const messages = page.messages;
 
-  if (messages.length === 0) {
+  if (messages.length === 0 && !page.hasMore) {
     return 'No messages found in this thread.';
   }
 
@@ -169,5 +179,7 @@ export async function handleFetchThreadMessages(
   return {
     messages: formattedMessages,
     message_count: messages.length,
+    has_more: page.hasMore,
+    next_cursor: page.nextCursor,
   };
 }

@@ -6,14 +6,11 @@ import type { SlackMessage, FormattedMessage } from '../types.js';
 
 import { formatSlackFile } from './file-download.js';
 
-/**
- * Format a Unix timestamp to human-readable date
- */
-export function formatTimestamp(ts: string): string {
-  const timestamp = parseFloat(ts) * 1000; // Convert to milliseconds
-  const date = new Date(timestamp);
+let messageTimestampFormatter: Intl.DateTimeFormat | undefined;
+let scheduledTimestampFormatter: Intl.DateTimeFormat | undefined;
 
-  return date.toLocaleString('en-US', {
+function getMessageTimestampFormatter(): Intl.DateTimeFormat {
+  messageTimestampFormatter ??= new Intl.DateTimeFormat('en-US', {
     year: 'numeric',
     month: 'short',
     day: 'numeric',
@@ -22,6 +19,31 @@ export function formatTimestamp(ts: string): string {
     second: '2-digit',
     hour12: false,
   });
+  return messageTimestampFormatter;
+}
+
+function getScheduledTimestampFormatter(): Intl.DateTimeFormat {
+  scheduledTimestampFormatter ??= new Intl.DateTimeFormat('en-US', {
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    timeZoneName: 'short',
+    hour12: true,
+  });
+  return scheduledTimestampFormatter;
+}
+
+/**
+ * Format a Unix timestamp to human-readable date
+ */
+export function formatTimestamp(ts: string): string {
+  const timestamp = parseFloat(ts) * 1000; // Convert to milliseconds
+  const date = new Date(timestamp);
+  return Number.isNaN(date.getTime())
+    ? 'Invalid Date'
+    : getMessageTimestampFormatter().format(date);
 }
 
 /**
@@ -81,14 +103,7 @@ export function formatMessage(
  */
 export function formatScheduledTime(postAt: number): string {
   const date = new Date(postAt * 1000);
-
-  return date.toLocaleString('en-US', {
-    year: 'numeric',
-    month: 'long',
-    day: 'numeric',
-    hour: '2-digit',
-    minute: '2-digit',
-    timeZoneName: 'short',
-    hour12: true,
-  });
+  return Number.isNaN(date.getTime())
+    ? 'Invalid Date'
+    : getScheduledTimestampFormatter().format(date);
 }
