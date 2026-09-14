@@ -24,14 +24,14 @@ import type {
   SlackUsersInfoResponse,
   SlackUsersListResponse,
   SlackMessage,
-  SlackMessagePage,
+  SlackThreadPage,
   SlackUser,
   SlackSearchMessagesResponse,
   SlackFile,
   SlackFilesInfoResponse,
   FileDownloadResult,
 } from './types.js';
-import { AuthenticationError, CancelledError, ValidationError } from './types.js';
+import { AuthenticationError, CancelledError, SlackError, ValidationError } from './types.js';
 import { handleSlackError } from './utils/errors.js';
 import {
   assertAllowedSlackDownloadUrl,
@@ -48,6 +48,7 @@ import { logger } from './utils/logger.js';
 import {
   assertAllowedSlackUrl,
   normalizeSlackWorkspaceUrl,
+  validateFetchLimit,
   validateSlackCookie,
 } from './utils/validation.js';
 
@@ -741,15 +742,18 @@ export class SlackClient {
   }
 
   /**
-   * Fetch replies from a thread
+   * Fetch one upstream page, separating parent context from paginated replies.
    */
   async fetchThreadReplies(params: {
     channel: string;
     thread_ts: string;
     limit?: number;
     cursor?: string;
-  }): Promise<SlackMessagePage> {
+  }): Promise<SlackThreadPage> {
     return this.withSlackError('fetch_thread_replies', async () => {
+      const limit = params.limit ?? 100;
+      validateFetchLimit(limit);
+      const cursor = params.cursor?.trim() || undefined;
       logger.info('Fetching thread replies', {
         channel: params.channel,
         thread_ts: params.thread_ts,
@@ -759,18 +763,56 @@ export class SlackClient {
         await this.getSlackApi<SlackConversationsRepliesResponse>('/conversations.replies', {
           channel: params.channel,
           ts: params.thread_ts,
-          limit: params.limit || 100,
-          cursor: params.cursor,
+          limit,
+          cursor,
         }),
         'Failed to fetch thread replies',
       );
 
-      logger.info(`Fetched ${response.messages.length} thread replies`);
+      // A reply link can identify a different timestamp than its thread root.
+      // Reject that mismatch rather than misclassifying the linked reply as the parent.
+      const differentThread = response.messages.find(
+        (message) => message.thread_ts && message.thread_ts !== params.thread_ts,
+      );
+      if (differentThread) {
+        throw new ValidationError(
+          `thread_ts must be the parent message timestamp; Slack returned thread ${differentThread.thread_ts}.`,
+        );
+      }
 
-      const nextCursor = response.response_metadata?.next_cursor || undefined;
+      const parentMessage =
+        response.messages.find((message) => message.ts === params.thread_ts) ?? null;
+      const messages = response.messages.filter((message) => message.ts !== params.thread_ts);
+      if (messages.length > limit) {
+        // The upstream cursor has already advanced over this entire page. Slicing
+        // the replies would permanently hide the discarded portion from callers.
+        throw new SlackError(
+          `Slack returned ${messages.length} replies for limit ${limit}; refusing to truncate the page.`,
+          'PAGINATION_ERROR',
+        );
+      }
+
+      const nextCursor = response.response_metadata?.next_cursor?.trim() || null;
+      if (response.has_more && !nextCursor) {
+        throw new SlackError(
+          'Slack reported more thread replies without a continuation cursor.',
+          'PAGINATION_ERROR',
+        );
+      }
+      if (nextCursor && nextCursor === cursor) {
+        throw new SlackError(
+          'Slack returned a thread cursor that did not advance.',
+          'PAGINATION_ERROR',
+        );
+      }
+
+      logger.info(`Fetched ${messages.length} thread replies`, {
+        parent_available: parentMessage !== null,
+      });
       return {
-        messages: response.messages,
-        hasMore: Boolean(response.has_more || nextCursor),
+        parentMessage,
+        messages,
+        hasMore: Boolean(nextCursor),
         nextCursor,
       };
     });

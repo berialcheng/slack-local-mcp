@@ -126,14 +126,14 @@ graph TB
 #### c. Fetch Tools (`fetch-tools.ts`)
 
 - **fetch_channel_messages**: Get recent messages from a channel
-- **fetch_thread_messages**: Get one page of messages from a specific thread
+- **fetch_thread_messages**: Get one page of replies with separate root-message context
 
 **Input Parameters**:
 
 ```typescript
 {
   channel: string;         // Channel ID
-  limit?: number;          // Number of messages (default: 50, max: 200)
+  limit?: number;          // Channel messages: default 50; thread replies: default 100; max 200
   thread_ts?: string;      // Thread timestamp for thread messages
   cursor?: string;         // Opaque continuation cursor for thread messages
   oldest?: string;         // Oldest timestamp to include
@@ -141,7 +141,7 @@ graph TB
 }
 ```
 
-**Output Format**:
+**Channel Output Format**:
 
 ```typescript
 {
@@ -161,6 +161,27 @@ graph TB
   next_cursor?: string;
 }
 ```
+
+**Thread Output Format (v2)**:
+
+```typescript
+{
+  thread_ts: string;
+  parent_message: FormattedMessage | null;
+  messages: FormattedMessage[]; // Replies only
+  message_count: number; // messages.length; excludes the root
+  has_more: boolean;
+  next_cursor: string | null;
+}
+```
+
+The Slack client separates the root by timestamp identity on every page, retaining
+all replies and forwarding the opaque Slack cursor. A missing root is explicitly
+`null`, not inferred from the first reply and not filled by an extra request.
+The handler formats the root and replies together; the dedicated thread formatter
+preserves this separation in JSON and TOON, including safe attachment metadata.
+Overfull reply pages and missing or stalled continuation cursors are errors.
+No process-wide pagination or deduplication state is required.
 
 #### d. Reaction Tools (`reaction-tools.ts`)
 
@@ -470,16 +491,21 @@ selection; ordinary resolution scans at most three user-list pages.
 
 ### 8. fetch_thread_messages
 
-**Description**: Fetch one page of messages from a specific thread
+**Description**: Fetch one page of replies with separate root context on every page
 
 **Parameters**:
 
 - `channel` (string, required): Channel ID
 - `thread_ts` (string, required): Thread parent timestamp
-- `limit` (number, optional): Max messages (default: 100, max: 200)
+- `limit` (number, optional): Max replies, excluding `parent_message` (default: 100, max: 200)
 - `cursor` (string, optional): Opaque cursor returned by the previous page
 
-**Returns**: Thread replies with `has_more` and `next_cursor` when another page remains
+**Returns**: `thread_ts`, `parent_message` (or `null` when unavailable), reply-only
+`messages`, `message_count`, `has_more`, and `next_cursor` (`null` at completion).
+Empty reply pages remain structured results and can still have a continuation
+cursor. Analyze the root and all reply pages together; retain the root once and
+deduplicate and sort replies by `ts` when assembling a whole thread. The v1
+assumption that the root is inside `messages` no longer applies.
 
 ---
 

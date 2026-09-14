@@ -179,11 +179,19 @@ test('cancels a hanging initialization when its bounded timeout expires', async 
   };
   const provider = new LazySlackClientProvider(async () => client, 20);
 
-  await assert.rejects(provider.getClient(), (error) => {
-    assert.ok(error instanceof TimeoutError);
-    assert.equal(error.code, 'TIMEOUT');
-    assert.match(error.message, /exceeded 20ms/);
-    return true;
-  });
-  assert.equal(internalSignal.aborted, true);
+  // Real stdio/network I/O keeps the event loop alive; this mock has no handles.
+  // Give the provider's intentionally unref'ed timer time to fire, with a bounded
+  // fallback so a broken timeout still fails rather than hanging the test process.
+  const keepAlive = setTimeout(() => {}, 1000);
+  try {
+    await assert.rejects(provider.getClient(), (error) => {
+      assert.ok(error instanceof TimeoutError);
+      assert.equal(error.code, 'TIMEOUT');
+      assert.match(error.message, /exceeded 20ms/);
+      return true;
+    });
+    assert.equal(internalSignal.aborted, true);
+  } finally {
+    clearTimeout(keepAlive);
+  }
 });

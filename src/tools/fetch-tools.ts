@@ -9,6 +9,7 @@ import type {
   FetchChannelMessagesInput,
   FetchThreadMessagesInput,
   FetchMessagesOutput,
+  FetchThreadMessagesOutput,
 } from '../types.js';
 import { formatMessage } from '../utils/formatters.js';
 import { logger } from '../utils/logger.js';
@@ -111,13 +112,13 @@ export async function handleFetchChannelMessages(
 export const fetchThreadMessagesTool = {
   name: 'fetch_thread_messages',
   description:
-    'Fetch one page of messages from a specific conversation thread, formatted for AI analysis. Returns has_more and next_cursor when additional replies remain.',
+    'Fetch one page of thread replies. parent_message contains the thread root on every page when available, or null if Slack omitted it. messages contains replies only; read both fields when analyzing a thread. Follow next_cursor until has_more is false, even if messages is empty.',
   inputSchema: z.object({
     channel: conversationIdSchema.describe(
       'Conversation ID where the thread exists (e.g., C12345678)',
     ),
     thread_ts: slackTimestampSchema.describe(
-      'Thread parent message timestamp (e.g., 1234567890.123456)',
+      'Thread parent timestamp (e.g., 1234567890.123456). For a reply permalink, use its thread_ts query parameter, not the linked reply timestamp.',
     ),
     limit: z
       .number()
@@ -126,7 +127,9 @@ export const fetchThreadMessagesTool = {
       .max(200)
       .optional()
       .default(100)
-      .describe('Maximum number of messages to fetch (default: 100, max: 200)'),
+      .describe(
+        'Maximum replies in messages, excluding parent_message (default: 100, max: 200). A page may contain fewer replies while next_cursor is still present.',
+      ),
     cursor: z
       .string()
       .trim()
@@ -140,9 +143,9 @@ export const fetchThreadMessagesTool = {
 export async function handleFetchThreadMessages(
   input: FetchThreadMessagesInput,
   client: SlackClient,
-): Promise<FetchMessagesOutput | string> {
+): Promise<FetchThreadMessagesOutput> {
   // Validate limit
-  const limit = input.limit || 100;
+  const limit = input.limit ?? 100;
   validateFetchLimit(limit);
 
   const channel = normalizeChannelId(input.channel);
@@ -163,12 +166,9 @@ export async function handleFetchThreadMessages(
   });
   const messages = page.messages;
 
-  if (messages.length === 0 && !page.hasMore) {
-    return 'No messages found in this thread.';
-  }
-
-  // Populate user cache for better formatting
-  await client.populateUserCache(messages);
+  // Parent context receives the same user, attachment, and reaction formatting
+  // as replies, including when there are no replies on this page.
+  await client.populateUserCache(page.parentMessage ? [page.parentMessage, ...messages] : messages);
   const userCache = client.getUserCache();
 
   // Format messages for output
@@ -177,6 +177,8 @@ export async function handleFetchThreadMessages(
   logger.info(`Successfully fetched ${messages.length} thread messages`);
 
   return {
+    thread_ts: input.thread_ts,
+    parent_message: page.parentMessage ? formatMessage(page.parentMessage, userCache) : null,
     messages: formattedMessages,
     message_count: messages.length,
     has_more: page.hasMore,

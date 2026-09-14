@@ -119,6 +119,9 @@ export function validateScheduleTimestamp(postAt: number): void {
  * Validate message fetch limit
  */
 export function validateFetchLimit(limit: number): void {
+  if (!Number.isInteger(limit)) {
+    throw new ValidationError('Limit must be a finite integer');
+  }
   if (limit < 1) {
     throw new ValidationError('Limit must be at least 1');
   }

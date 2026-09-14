@@ -313,9 +313,12 @@ async function main() {
         limit: 20,
       });
       assert.ok(isObject(thread) && Array.isArray(thread.messages));
-      assert.ok(thread.messages.some((message) => message.ts === root.ts));
+      assert.equal(thread.parent_message?.ts, root.ts);
+      assert.equal(thread.thread_ts, root.ts);
+      assert.ok(thread.messages.every((message) => message.ts !== root.ts));
       assert.ok(thread.messages.some((message) => message.ts === reply.ts));
-      record(checks, 'pass', 'fetch_thread_messages', `${thread.message_count} messages`);
+      assert.equal(thread.message_count, thread.messages.length);
+      record(checks, 'pass', 'fetch_thread_messages', `${thread.message_count} replies + parent`);
 
       const channelMessages = await callTool('fetch_channel_messages', {
         channel: root.channel,

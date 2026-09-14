@@ -78,7 +78,7 @@ function getToolFormatters(): Promise<typeof ToolFormatters> {
 const server = new Server(
   {
     name: 'slack-mcp',
-    version: '1.6.0',
+    version: '2.0.0',
   },
   {
     capabilities: {
@@ -167,7 +167,7 @@ const coreTools: RegisteredTool[] = [
     fetchThreadMessagesTool,
     handleFetchThreadMessages,
     (formatters, result, client) =>
-      formatters.formatFetchMessagesResponse(result, 'toon', client.getUserCache()),
+      formatters.formatFetchThreadMessagesResponse(result, 'toon', client.getUserCache()),
   ),
   registerJsonTool(addReactionTool, handleAddReaction),
   registerFormattedTool(searchUsersTool, handleSearchUsers, (formatters, result) =>

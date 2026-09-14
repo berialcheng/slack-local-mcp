@@ -1,6 +1,6 @@
 {
   "name": "slack-local-mcp",
-  "version": "1.6.0",
+  "version": "2.0.0",
   "description": "A lightweight MCP server for Slack automation using cookie-based authentication - no app setup required",
   "type": "module",
   "main": "build/index.js",
@@ -15,7 +15,7 @@
     "lint": "eslint \"src/**/*.ts\"",
     "lint:fix": "npm run lint -- --fix",
     "test": "npm run test:unit",
-    "test:unit": "npm run build && node --test test/windows-launcher.test.mjs test/file-download.test.mjs test/logger.test.mjs test/lazy-slack-client.test.mjs test/lazy-startup.test.mjs test/resilience.test.mjs",
+    "test:unit": "npm run build && node --test test/windows-launcher.test.mjs test/file-download.test.mjs test/logger.test.mjs test/lazy-slack-client.test.mjs test/lazy-startup.test.mjs test/resilience.test.mjs test/thread-pagination.test.mjs",
     "test:live": "npm run build && node test-slack-mcp.js",
     "test:windows": "node --test test/windows-launcher.test.mjs"
   },

@@ -7,6 +7,8 @@ import { encode } from '@toon-format/toon';
 
 import type {
   FetchMessagesOutput,
+  FetchThreadMessagesOutput,
+  FormattedMessage,
   FormattedSlackFile,
   SearchMessagesOutput,
   SlackReaction,
@@ -74,7 +76,7 @@ function encodeSafely<T>(
 }
 
 /**
- * Format fetch messages response (fetch_channel_messages, fetch_thread_messages)
+ * Format fetch_channel_messages responses.
  * Flattens reactions for TOON tabular format
  */
 export function formatFetchMessagesResponse(
@@ -88,17 +90,40 @@ export function formatFetchMessagesResponse(
 
   return encodeSafely(data, 'fetch messages', (value) => ({
     ...value,
-    messages: value.messages.map((message) => ({
-      user: message.user,
-      text: message.text,
-      ts: message.ts,
-      timestamp: message.timestamp,
-      thread_ts: message.thread_ts || '',
-      reply_count: message.reply_count || 0,
-      is_bot: message.is_bot || false,
-      files: formatFiles(message.files),
-      reactions: formatReactions(message.reactions, userCache),
-    })),
+    messages: value.messages.map((message) => formatMessageForToon(message, userCache)),
+  }));
+}
+
+function formatMessageForToon(message: FormattedMessage, userCache: Map<string, string>) {
+  return {
+    user: message.user,
+    text: message.text,
+    ts: message.ts,
+    timestamp: message.timestamp,
+    thread_ts: message.thread_ts || '',
+    reply_count: message.reply_count || 0,
+    is_bot: message.is_bot || false,
+    files: formatFiles(message.files),
+    reactions: formatReactions(message.reactions, userCache),
+  };
+}
+
+/** Keep parent context separate from replies in both JSON and TOON. */
+export function formatFetchThreadMessagesResponse(
+  data: FetchThreadMessagesOutput | McpErrorResponse,
+  format: 'toon' | 'json',
+  userCache: Map<string, string>,
+): string {
+  if (format === 'json' || isMcpErrorResponse(data)) {
+    return stringifyJson(data);
+  }
+
+  return encodeSafely(data, 'fetch thread messages', (value) => ({
+    ...value,
+    parent_message: value.parent_message
+      ? formatMessageForToon(value.parent_message, userCache)
+      : null,
+    messages: value.messages.map((message) => formatMessageForToon(message, userCache)),
   }));
 }
 

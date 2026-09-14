@@ -246,9 +246,41 @@ intentionally served without another Slack request for up to one hour. Use a
 concrete user ID or refresh the cache when current directory state matters more
 than the zero-network fast path.
 
-`fetch_thread_messages` returns at most 200 messages per call. When more replies
-remain, the response includes `has_more=true` and `next_cursor`; pass that cursor
-back to continue without restarting the thread scan.
+### Thread pagination (v2)
+
+`fetch_thread_messages` separates thread context from paginated replies:
+
+- `thread_ts` identifies the requested thread root.
+- `parent_message` contains the formatted root message on every page where Slack
+  returns it. If Slack omits the root, this field is explicitly `null`; no extra
+  request is made to reconstruct it.
+- `messages` contains only this page's replies. `message_count` equals its length
+  and does not include `parent_message`.
+- `limit` caps replies per page (default 100, maximum 200). A page may contain
+  fewer replies, or none, while still having a continuation cursor. The server
+  does not fetch extra pages to fill the limit.
+- `has_more=true` always comes with a usable `next_cursor`. Pass that cursor with
+  the same `channel` and `thread_ts` to continue; completion returns
+  `has_more=false` and `next_cursor=null`. An overfull reply page, missing
+  continuation cursor, or unchanged cursor produces an explicit error rather
+  than silently discarding replies or looping.
+
+For thread analysis, read both `parent_message` and `messages`. Follow all pages,
+retain the root once, and deduplicate and sort the replies by their string `ts`
+identifiers before analyzing the complete conversation. Preserve upstream order
+within each page; do not assume that concatenated pages are globally chronological.
+Pagination is not a snapshot of a thread that is concurrently being edited.
+Missing root context or an interrupted scan must be reported as incomplete context.
+
+The tool still accepts a channel ID and **root** timestamp, not a URL. When a
+permalink points at a reply, resolve its `thread_ts` query parameter or the linked
+message's thread identity before calling; do not assume the linked reply is the root.
+
+**Migration from v1:** the root no longer appears inside `messages`. Update callers
+to read `parent_message` separately, including threads with zero replies. Thread
+results now always use the structured object above, including empty pages; channel
+history and search response formats are unchanged. This is a breaking response
+change in version 2.0.0.
 
 ### 📁 File Metadata and Downloads
 

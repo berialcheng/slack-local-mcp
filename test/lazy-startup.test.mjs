@@ -35,6 +35,7 @@ test('completes MCP startup without loading or authenticating the Slack client',
   try {
     await client.connect(transport);
     const tools = await client.listTools();
+    assert.equal(client.getServerVersion().version, '2.0.0');
 
     assert.deepEqual(tools.tools.map((tool) => tool.name).sort(), [
       'add_reaction',
@@ -61,6 +62,14 @@ test('completes MCP startup without loading or authenticating the Slack client',
     assert.equal(
       fetchChannelMessages.inputSchema.properties.channel.pattern,
       '^[CGD][A-Z0-9]{8,}$',
+    );
+
+    const fetchThreadMessages = tools.tools.find((tool) => tool.name === 'fetch_thread_messages');
+    assert.match(fetchThreadMessages.description, /parent_message/);
+    assert.match(fetchThreadMessages.description, /messages contains replies only/);
+    assert.match(
+      fetchThreadMessages.inputSchema.properties.limit.description,
+      /excluding parent_message/,
     );
 
     // Allow any accidentally-started background authentication to emit a log.

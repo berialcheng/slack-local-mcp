@@ -120,10 +120,12 @@ export interface SlackConversationsRepliesResponse extends SlackApiResponse {
   };
 }
 
-export interface SlackMessagePage {
+export interface SlackThreadPage {
+  parentMessage: SlackMessage | null;
+  /** Replies only; the parent never contributes to the page size. */
   messages: SlackMessage[];
   hasMore: boolean;
-  nextCursor?: string;
+  nextCursor: string | null;
 }
 
 export interface SlackConversationsOpenResponse extends SlackApiResponse {
@@ -322,6 +324,17 @@ export interface FetchMessagesOutput {
   message_count: number;
   has_more?: boolean;
   next_cursor?: string;
+}
+
+export interface FetchThreadMessagesOutput {
+  thread_ts: string;
+  /** Context returned on every page, or null when Slack omitted the parent. */
+  parent_message: FormattedMessage | null;
+  messages: FormattedMessage[];
+  /** Number of replies in messages, excluding parent_message. */
+  message_count: number;
+  has_more: boolean;
+  next_cursor: string | null;
 }
 
 export interface FormattedMessage {

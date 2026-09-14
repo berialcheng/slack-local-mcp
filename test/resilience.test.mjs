@@ -474,6 +474,7 @@ test('passes a thread cursor through and exposes truncation metadata', async () 
     fetchThreadReplies: async (params) => {
       observedParams = params;
       return {
+        parentMessage: null,
         messages: [
           {
             type: 'message',
@@ -497,12 +498,15 @@ test('passes a thread cursor through and exposes truncation metadata', async () 
     cursor: 'cursor-2',
   });
   assert.equal(result.message_count, 1);
+  assert.equal(result.parent_message, null);
+  assert.equal(result.thread_ts, input.thread_ts);
   assert.equal(result.messages[0].user, 'Cheng Zhong');
   assert.equal(result.has_more, true);
   assert.equal(result.next_cursor, 'cursor-3');
 
   const emptyContinuation = await handleFetchThreadMessages(input, {
     fetchThreadReplies: async () => ({
+      parentMessage: null,
       messages: [],
       hasMore: true,
       nextCursor: 'cursor-4',
